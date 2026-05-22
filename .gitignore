@@ -1,0 +1,15 @@
+# CLion
+.idea/
+cmake-build-*/
+.run/
+simulation/build
+
+# VS Code
+.vscode/*
+*.vsix
+
+# PlatformIO
+.pio/
+
+# macOS
+.DS_Store
