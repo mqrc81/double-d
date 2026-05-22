@@ -30,6 +30,7 @@ void setup() {
 
     pinMode(LED_PIN, OUTPUT);
     pinMode(POT_PIN, INPUT); // Configure ADC pin
+}
 
 void loop() {
     if (!sensorReady) {
