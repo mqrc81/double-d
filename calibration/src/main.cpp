@@ -4,11 +4,13 @@
 #include <WiFi.h>
 #include <esp_now.h>
 #include <Preferences.h>
+#include <Adafruit_MPU6050.h>
+#include <Adafruit_Sensor.h>
 
 // ─── Pin definitions ──────────────────────────────────────────────
-#define SDA_PIN         17
-#define SCL_PIN         18
-#define LED_PIN         35
+#define SDA_PIN         21
+#define SCL_PIN         22
+#define LED_PIN         4
 #define BUZZER_PIN      33      // adjust to your wiring
 #define BUTTON_PIN      0       // PRG button, active LOW
 
@@ -63,7 +65,7 @@ typedef enum {
 CalibState state = STATE_WAITING;
 
 // ─── Car IMU ──────────────────────────────────────────────────────
-MPU6050 mpu;
+Adafruit_MPU6050 mpu;
 float carPitch = 0.0f;
 float carRoll = 0.0f;
 int64_t lastTimerUs = 0;
@@ -157,7 +159,7 @@ void setup() {
 
     // ── Car IMU ──
     Wire.begin(SDA_PIN, SCL_PIN);
-    mpu.initialize();
+    mpu.begin();
     if (!mpu.testConnection()) {
         Serial.println("[ERROR] Car MPU6050 not found.");
         while (true) { delay(1000); }
@@ -299,8 +301,8 @@ void onDataReceived(const uint8_t *mac, const uint8_t *data, int len) {
 
 // ─────────────────────────────────────────────────────────────────
 void updateCarIMU() {
-    int16_t ax, ay, az, gx, gy, gz;
-    mpu.getMotion6(&ax, &ay, &az, &gx, &gy, &gz);
+    sensors_event_t a, g, temp;
+    mpu.getEvent(&a, &g, &temp);
 
     int64_t nowUs = esp_timer_get_time();
     float dt = (nowUs - lastTimerUs) / 1e6f;
@@ -311,8 +313,10 @@ void updateCarIMU() {
     float accelPitch = atan2f((float) ay, (float) az) * 180.0f / PI;
     float accelRoll = atan2f((float) ax, (float) az) * 180.0f / PI;
 
-    float gyroPitchRate = (float) gx / 131.0f;
-    float gyroRollRate = (float) gy / 131.0f;
+    // acceleration in m/s² — divide by 9.81 to get g, or use directly in atan2
+    float accelPitch = atan2f(a.acceleration.y, a.acceleration.z) * 180.0f / PI;
+    // gyro in rad/s — convert to deg/s
+    float gyroPitchRate = g.gyro.x * 180.0f / PI;
 
     carPitch = ALPHA * (carPitch + gyroPitchRate * dt) + (1.0f - ALPHA) * accelPitch;
     carRoll = ALPHA * (carRoll + gyroRollRate * dt) + (1.0f - ALPHA) * accelRoll;
