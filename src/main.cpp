@@ -11,10 +11,10 @@ bool sensorReady = false;
 
 void setup() {
     Serial.begin(115200);
-    delay(1000); 
+    delay(1000);
 
     // Initialize I2C on standard ESP32 DevKit pins
-    Wire.begin(21, 22); 
+    Wire.begin(21, 22);
 
     if (!mpu.begin()) {
         Serial.println("[ERROR] MPU-6050 not detected.");
@@ -22,7 +22,7 @@ void setup() {
     } else {
         Serial.println("[SUCCESS] MPU-6050 connected.");
         sensorReady = true;
-        
+
         mpu.setAccelerometerRange(MPU6050_RANGE_8_G);
         mpu.setGyroRange(MPU6050_RANGE_500_DEG);
         mpu.setFilterBandwidth(MPU6050_BAND_21_HZ);
@@ -36,16 +36,16 @@ void loop() {
     if (!sensorReady) {
         digitalWrite(LED_PIN, HIGH); delay(100);
         digitalWrite(LED_PIN, LOW);  delay(100);
-        return; 
+        return;
     }
 
     // --- 1. READ POTENTIOMETER & DYNAMICALLY CALCULATE THRESHOLD ---
     // ESP32 ADC reads from 0 to 4095 (12-bit resolution)
     int rawPotValue = analogRead(POT_PIN);
-    
+
     // Convert to a clean 0.0 to 1.0 factor
-    float potPercentage = (float)rawPotValue / 4095.0f; 
-    
+    float potPercentage = (float) rawPotValue / 4095.0f;
+
     // Linearly interpolate between 2.0 (low end) and 4.0 (high end)
     float dynamicThreshold = 2.0f + (potPercentage * (4.0f - 2.0f));
 

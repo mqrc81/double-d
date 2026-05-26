@@ -1,21 +1,20 @@
 #include <Arduino.h>
 #include <Wire.h>
-#include <MPU6050.h>
+#include <Adafruit_MPU6050.h>
+#include <Adafruit_Sensor.h>
 #include <WiFi.h>
 #include <esp_now.h>
 
 // ─── Pin definitions ──────────────────────────────────────────────
-// Adjust to match your wiring.
-// GPIO17/18 are the Heltec OLED I2C pins — safe to reuse
-// on the hat board since we're not using the OLED here.
-// If you want the OLED for debug output, use different pins
-// for the MPU-6050 and update accordingly.
+// Heltec OLED I2C pins — safe to reuse on the hat board since we're
+// not using the OLED here. If you want the OLED for debug output,
+// use different pins for the MPU-6050 and update accordingly.
 #define SDA_PIN 17
 #define SCL_PIN 18
 
 // ─── Sampling ─────────────────────────────────────────────────────
-#define SAMPLE_RATE_HZ      50
-#define SAMPLE_INTERVAL_MS  (1000 / SAMPLE_RATE_HZ)  // 20ms
+#define SAMPLE_RATE_HZ         50
+#define SAMPLE_INTERVAL_US     (1000000 / SAMPLE_RATE_HZ)  // 20000us
 
 // ─── Complementary filter ─────────────────────────────────────────
 // MUST match car firmware and calibration firmware exactly.
@@ -32,14 +31,17 @@ typedef struct __attribute__((packed)) {
 } HatImuPacket;
 
 // ─── Globals ──────────────────────────────────────────────────────
-MPU6050 mpu;
+Adafruit_MPU6050 mpu;
 HatImuPacket packet;
 
 float pitch = 0.0f;
 float roll = 0.0f;
 
-unsigned long lastSampleTime = 0;
+// Both sample gating and dt computation use esp_timer_get_time()
+// so they share a single clock — no millis/microseconds mismatch.
+int64_t lastSampleUs = 0;
 int64_t lastTimerUs = 0;
+
 uint8_t seqNum = 0;
 
 // Broadcast to all ESP-NOW peers on the same channel.
@@ -63,28 +65,26 @@ void setup() {
 
     // ── I2C + MPU6050 ──
     Wire.begin(SDA_PIN, SCL_PIN);
-    mpu.initialize();
 
-    if (!mpu.testConnection()) {
+    if (!mpu.begin()) {
         Serial.println("[ERROR] MPU6050 not found. Check wiring.");
         while (true) { delay(1000); }
     }
     Serial.println("[OK] MPU6050 connected.");
 
     // ── Configure MPU6050 ──
-    // Default full-scale ranges:
-    //   Accelerometer: ±2g  → 16384 LSB/g
-    //   Gyroscope:     ±250°/s → 131 LSB/deg/s
-    // If you change these via mpu.setFullScaleGyroRange()
-    // or mpu.setFullScaleAccelRange(), update the divisors
-    // in the main loop accordingly, and do the same in
-    // car firmware and calibration firmware.
-    mpu.setFullScaleGyroRange(MPU6050_GYRO_FS_250);
-    mpu.setFullScaleAccelRange(MPU6050_ACCEL_FS_2);
+    // ±250°/s gyro and ±2g accel match the handoff spec.
+    // If you change these here, update the same settings in car
+    // firmware and calibration firmware — the Adafruit library
+    // handles unit conversion internally so the complementary
+    // filter math stays the same, but ALPHA may need retuning.
+    mpu.setGyroRange(MPU6050_RANGE_250_DEG);
+    mpu.setAccelerometerRange(MPU6050_RANGE_2_G);
+    mpu.setFilterBandwidth(MPU6050_BAND_21_HZ);
 
     // ── WiFi in STA mode for ESP-NOW ──
-    // Not connected to any network — just needed to
-    // initialise the radio hardware for ESP-NOW.
+    // Not connected to any network — just needed to initialise
+    // the radio hardware for ESP-NOW.
     WiFi.mode(WIFI_STA);
     WiFi.disconnect();
 
@@ -113,50 +113,49 @@ void setup() {
 
     Serial.printf("[OK] ESP-NOW ready. Sending at %dHz.\n", SAMPLE_RATE_HZ);
 
-    lastSampleTime = millis();
-    lastTimerUs = esp_timer_get_time();
+    // Seed both timers from the same clock read so the first
+    // dt computation is correct and the first sample fires
+    // immediately.
+    int64_t now = esp_timer_get_time();
+    lastSampleUs = now;
+    lastTimerUs = now;
 }
 
 // ─────────────────────────────────────────────────────────────────
 void loop() {
-    unsigned long now = millis();
+    int64_t nowUs = esp_timer_get_time();
 
-    // Pace the loop to SAMPLE_RATE_HZ
-    if (now - lastSampleTime < SAMPLE_INTERVAL_MS) return;
-    lastSampleTime = now;
+    // Pace the loop to SAMPLE_RATE_HZ using the same clock
+    // as dt — no millis/esp_timer mismatch.
+    if (nowUs - lastSampleUs < SAMPLE_INTERVAL_US) return;
+    lastSampleUs = nowUs;
 
     // ── Read MPU6050 ──
-    int16_t ax, ay, az, gx, gy, gz;
-    mpu.getMotion6(&ax, &ay, &az, &gx, &gy, &gz);
+    sensors_event_t a, g, temp;
+    mpu.getEvent(&a, &g, &temp);
 
     // ── Compute dt ──
-    int64_t nowUs = esp_timer_get_time();
     float dt = (nowUs - lastTimerUs) / 1e6f;
     lastTimerUs = nowUs;
 
-    // Guard against first-loop spike or anomalous dt
+    // Guard against first-loop spike or anomalous dt.
     if (dt <= 0.0f || dt > 0.1f) {
-        dt = SAMPLE_INTERVAL_MS / 1000.0f;
+        dt = SAMPLE_INTERVAL_US / 1e6f;
     }
 
     // ── Accelerometer angles ──
     // atan2 gives angle in radians — convert to degrees.
     // Assumes MPU6050 is mounted with Z axis pointing up.
-    // If your hat mounting orients the IMU differently,
-    // you may need to swap axes here. Test by tilting
-    // the hat forward and checking pitch increases as expected.
-    float accelPitch = atan2f((float) ay, (float) az) * 180.0f / PI;
-    float accelRoll = atan2f((float) ax, (float) az) * 180.0f / PI;
+    // If the hat mounting orients the IMU differently,
+    // swap axes here and do the same in car/calibration firmware.
+    // Test by tilting the hat forward and verifying pitch increases.
+    float accelPitch = atan2f(a.acceleration.y, a.acceleration.z) * 180.0f / PI;
+    float accelRoll = atan2f(a.acceleration.x, a.acceleration.z) * 180.0f / PI;
 
     // ── Gyroscope rates (deg/s) ──
-    // Divisor matches ±250°/s full-scale range.
-    // Update if you changed setFullScaleGyroRange() above:
-    //   ±250°/s  → 131.0
-    //   ±500°/s  → 65.5
-    //   ±1000°/s → 32.8
-    //   ±2000°/s → 16.4
-    float gyroPitchRate = (float) gx / 131.0f;
-    float gyroRollRate = (float) gy / 131.0f;
+    // Adafruit library outputs rad/s — convert to deg/s for the filter.
+    float gyroPitchRate = g.gyro.x * 180.0f / PI;
+    float gyroRollRate = g.gyro.y * 180.0f / PI;
 
     // ── Complementary filter ──
     pitch = ALPHA * (pitch + gyroPitchRate * dt) + (1.0f - ALPHA) * accelPitch;
@@ -171,9 +170,8 @@ void loop() {
     esp_now_send(broadcastMac, (uint8_t *) &packet, sizeof(HatImuPacket));
 
     // ── Serial debug ──
-    // Useful during bench testing to verify filter output.
-    // Disable in deployment — 50Hz serial output adds
-    // jitter to sample timing and wastes power.
+    // Disable before deployment — 50Hz serial output adds jitter
+    // to sample timing and wastes power.
     Serial.printf("[HAT] pitch=%.2f roll=%.2f seq=%d\n",
                   pitch, roll, packet.seq);
 }
