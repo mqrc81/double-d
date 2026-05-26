@@ -13,7 +13,7 @@
 #define SCL_PIN 18
 
 // ─── Sampling ─────────────────────────────────────────────────────
-#define SAMPLE_RATE_HZ         50
+#define SAMPLE_RATE_HZ         20
 #define SAMPLE_INTERVAL_US     (1000000 / SAMPLE_RATE_HZ)  // 20000us
 
 // ─── Complementary filter ─────────────────────────────────────────
@@ -170,7 +170,7 @@ void loop() {
     esp_now_send(broadcastMac, (uint8_t *) &packet, sizeof(HatImuPacket));
 
     // ── Serial debug ──
-    // Disable before deployment — 50Hz serial output adds jitter
+    // TODO disable before deployment — 20Hz serial output adds jitter
     // to sample timing and wastes power.
     Serial.printf("[HAT] pitch=%.2f roll=%.2f seq=%d\n",
                   pitch, roll, packet.seq);

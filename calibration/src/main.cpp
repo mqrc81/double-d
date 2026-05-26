@@ -16,7 +16,7 @@
 #define BUTTON_PIN      0       // Boot button, active LOW
 
 // ─── Sampling ─────────────────────────────────────────────────────
-#define SAMPLE_RATE_HZ          50
+#define SAMPLE_RATE_HZ          20
 #define SAMPLE_INTERVAL_US      (1000000 / SAMPLE_RATE_HZ)  // 20000us
 
 // ─── Complementary filter ─────────────────────────────────────────
@@ -25,7 +25,7 @@
 
 // ─── Phase 1 — Alert baseline ─────────────────────────────────────
 // How long to collect alert driving data.
-// 3 minutes at 50Hz = 9000 samples — sufficient for
+// 3 minutes at 20Hz = 3600 samples — sufficient for
 // stable mean and std via Welford's algorithm.
 #define ALERT_DURATION_MS       (3 * 60 * 1000)
 
@@ -107,7 +107,7 @@ int nodCount = 0;
 
 // Rolling buffer for drop rate computation — holds last
 // RATE_WINDOW samples of differential pitch.
-#define RATE_WINDOW 25          // 25 samples at 50Hz = 500ms
+#define RATE_WINDOW 25          // 25 samples at 20Hz = 1250ms
 float pitchHistory[RATE_WINDOW];
 int historyIndex = 0;
 bool historyFull = false;
