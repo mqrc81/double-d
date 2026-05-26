@@ -1,8 +1,6 @@
 # CLion
 .idea/
-cmake-build-*/
 .run/
-simulation/build
 
 # VS Code
 .vscode/*
