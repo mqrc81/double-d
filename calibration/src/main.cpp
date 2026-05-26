@@ -1,22 +1,23 @@
 #include <Arduino.h>
 #include <Wire.h>
-#include <MPU6050.h>
+#include <Adafruit_MPU6050.h>
+#include <Adafruit_Sensor.h>
 #include <WiFi.h>
 #include <esp_now.h>
 #include <Preferences.h>
-#include <Adafruit_MPU6050.h>
-#include <Adafruit_Sensor.h>
 
 // ─── Pin definitions ──────────────────────────────────────────────
+// Update to match your actual wiring.
+// Handoff spec: LED=GPIO2, buzzer=GPIO4, button=GPIO0.
 #define SDA_PIN         21
 #define SCL_PIN         22
 #define LED_PIN         4
-#define BUZZER_PIN      33      // adjust to your wiring
-#define BUTTON_PIN      0       // PRG button, active LOW
+#define BUZZER_PIN      33      // TODO adjust to your wiring
+#define BUTTON_PIN      0       // Boot button, active LOW
 
 // ─── Sampling ─────────────────────────────────────────────────────
 #define SAMPLE_RATE_HZ          50
-#define SAMPLE_INTERVAL_MS      (1000 / SAMPLE_RATE_HZ)   // 20ms
+#define SAMPLE_INTERVAL_US      (1000000 / SAMPLE_RATE_HZ)  // 20000us
 
 // ─── Complementary filter ─────────────────────────────────────────
 // Must match hat firmware exactly.
@@ -28,16 +29,15 @@
 // stable mean and std via Welford's algorithm.
 #define ALERT_DURATION_MS       (3 * 60 * 1000)
 
-// ─── Phase 2 — Drowsy calibration ────────────────────────────────
+// ─── Phase 2 — Drowsy calibration ─────────────────────────────────
 // Number of nod peaks to collect before computing thresholds.
 // Passenger presses button at peak of each nod.
 #define NOD_COUNT_TARGET        8
 
-// ─── Outlier rejection (Phase 1) ─────────────────────────────────
+// ─── Outlier rejection (Phase 1) ──────────────────────────────────
 // Samples exceeding this absolute differential pitch are
 // discarded during alert baseline collection — catches sharp
 // turns, sudden braking, and hat adjustment mid-drive.
-// Generous threshold so normal driving is never rejected.
 #define OUTLIER_THRESHOLD_DEG   25.0f
 
 // ─── Re-zero duration ─────────────────────────────────────────────
@@ -71,6 +71,8 @@ float carRoll = 0.0f;
 int64_t lastTimerUs = 0;
 
 // ─── Hat data (written by ESP-NOW callback) ───────────────────────
+// Access only under hatMux to avoid race conditions on dual-core.
+portMUX_TYPE hatMux = portMUX_INITIALIZER_UNLOCKED;
 volatile float hatPitch = 0.0f;
 volatile float hatRoll = 0.0f;
 volatile bool hatDataReady = false;
@@ -81,12 +83,10 @@ volatile uint8_t lastHatSeq = 255;
 uint8_t hatMac[] = {0xAA, 0xBB, 0xCC, 0xDD, 0xEE, 0xFF};
 
 // ─── Re-zero state ────────────────────────────────────────────────
-// Accumulates differential signal during stationary re-zero
-// to compute placement offset for this session.
 double rezeroSumPitch = 0.0;
 double rezeroSumRoll = 0.0;
 int rezeroCount = 0;
-float rezeroOffsetPitch = 0.0f; // applied to all subsequent readings
+float rezeroOffsetPitch = 0.0f;
 float rezeroOffsetRoll = 0.0f;
 unsigned long rezeroStartMs = 0;
 
@@ -96,16 +96,16 @@ double wMeanRoll = 0.0, wM2Roll = 0.0;
 int wCount = 0;
 unsigned long alertStartMs = 0;
 
-// ─── Phase 2: Nod peak collection ────────────────────────────────
+// ─── Phase 2: Nod peak collection ─────────────────────────────────
 // Stores (peak differential pitch, drop rate) for each nod.
 // Drop rate computed from derivative of differential pitch
 // over the 500ms window preceding the button press.
 #define MAX_NODS    16
-float nodPeaks[MAX_NODS]; // peak differential pitch at each nod
-float nodRates[MAX_NODS]; // drop rate (deg/s) leading into peak
+float nodPeaks[MAX_NODS];
+float nodRates[MAX_NODS];
 int nodCount = 0;
 
-// Rolling buffer for derivative computation — holds last
+// Rolling buffer for drop rate computation — holds last
 // RATE_WINDOW samples of differential pitch.
 #define RATE_WINDOW 25          // 25 samples at 50Hz = 500ms
 float pitchHistory[RATE_WINDOW];
@@ -128,6 +128,8 @@ void updatePitchHistory(float diffPitch);
 
 void handleButton();
 
+void onButtonPressed();
+
 void runRezero();
 
 void runAlertCollect();
@@ -139,10 +141,6 @@ void saveToNVS();
 void buzzerBeeps(int count, int durationMs = 150, int gapMs = 150);
 
 void setLED(bool on);
-
-void blinkLED(int periodMs);
-
-void printState();
 
 void onDataReceived(const uint8_t *mac, const uint8_t *data, int len);
 
@@ -159,13 +157,13 @@ void setup() {
 
     // ── Car IMU ──
     Wire.begin(SDA_PIN, SCL_PIN);
-    mpu.begin();
-    if (!mpu.testConnection()) {
-        Serial.println("[ERROR] Car MPU6050 not found.");
+    if (!mpu.begin()) {
+        Serial.println("[ERROR] Car MPU6050 not found. Check wiring.");
         while (true) { delay(1000); }
     }
-    mpu.setFullScaleGyroRange(MPU6050_GYRO_FS_250);
-    mpu.setFullScaleAccelRange(MPU6050_ACCEL_FS_2);
+    mpu.setGyroRange(MPU6050_RANGE_250_DEG);
+    mpu.setAccelerometerRange(MPU6050_RANGE_2_G);
+    mpu.setFilterBandwidth(MPU6050_BAND_21_HZ);
     Serial.println("[OK] Car MPU6050 connected.");
 
     // ── WiFi for ESP-NOW ──
@@ -181,122 +179,109 @@ void setup() {
     }
     esp_now_register_recv_cb(onDataReceived);
 
-    // Register hat as peer (for filtering — we only process
-    // packets from the known hat MAC, ignoring any other
-    // ESP-NOW devices on the same channel)
+    // Register hat as peer so we can filter packets by source MAC.
     esp_now_peer_info_t peerInfo = {};
     memcpy(peerInfo.peer_addr, hatMac, 6);
     peerInfo.channel = 0;
     peerInfo.encrypt = false;
     if (esp_now_add_peer(&peerInfo) != ESP_OK) {
         Serial.println("[WARN] Could not register hat peer.");
-        // Non-fatal — we still filter by MAC in the callback
+        // Non-fatal — MAC filtering in the callback still works.
     }
 
-    // Initialise pitch history buffer to zero
     memset(pitchHistory, 0, sizeof(pitchHistory));
-
     lastTimerUs = esp_timer_get_time();
 
-    Serial.println("[OK] Ready. Press PRG button to begin calibration.");
+    Serial.println("[OK] Ready. Press Boot button to begin calibration.");
     Serial.println("     Phase 1: drive normally for 3 minutes.");
     Serial.println("     Phase 2: simulate drowsy nods (passenger presses button at each peak).");
 }
 
 // ─────────────────────────────────────────────────────────────────
 void loop() {
-    static unsigned long lastSampleMs = 0;
+    static int64_t lastSampleUs = 0;
     static unsigned long lastBlinkMs = 0;
     static bool ledBlinkState = false;
 
-    unsigned long now = millis();
+    int64_t nowUs = esp_timer_get_time();
 
-    // ── Pace main loop to sample rate ──
-    if (now - lastSampleMs < SAMPLE_INTERVAL_MS) return;
-    lastSampleMs = now;
+    // Pace main loop to sample rate — all timing from one clock
+    if (nowUs - lastSampleUs < SAMPLE_INTERVAL_US) return;
+    lastSampleUs = nowUs;
 
-    // ── Always update car IMU ──
     updateCarIMU();
-
-    // ── Handle button ──
     handleButton();
 
-    // ── State-specific logic ──
+    unsigned long nowMs = millis();
     switch (state) {
         case STATE_WAITING:
-            // Slow blink — waiting for user
-            if (now - lastBlinkMs > 1000) {
+            if (nowMs - lastBlinkMs > 1000) {
                 ledBlinkState = !ledBlinkState;
                 setLED(ledBlinkState);
-                lastBlinkMs = now;
+                lastBlinkMs = nowMs;
             }
             break;
 
         case STATE_REZERO:
             runRezero();
-            // Fast blink during re-zero
-            if (now - lastBlinkMs > 200) {
+            if (nowMs - lastBlinkMs > 200) {
                 ledBlinkState = !ledBlinkState;
                 setLED(ledBlinkState);
-                lastBlinkMs = now;
+                lastBlinkMs = nowMs;
             }
             break;
 
         case STATE_ALERT_COLLECT:
             runAlertCollect();
-            // Very fast blink during alert collection
-            if (now - lastBlinkMs > 100) {
+            if (nowMs - lastBlinkMs > 100) {
                 ledBlinkState = !ledBlinkState;
                 setLED(ledBlinkState);
-                lastBlinkMs = now;
+                lastBlinkMs = nowMs;
             }
             break;
 
         case STATE_ALERT_DONE:
-            // Solid LED — waiting for Phase 2 to begin
             setLED(true);
             break;
 
         case STATE_DROWSY_COLLECT:
             runDrowsyCollect();
-            // Double blink pattern — distinct from Phase 1
-            if (now - lastBlinkMs > 300) {
+            if (nowMs - lastBlinkMs > 300) {
                 ledBlinkState = !ledBlinkState;
                 setLED(ledBlinkState);
-                lastBlinkMs = now;
+                lastBlinkMs = nowMs;
             }
             break;
 
         case STATE_COMPLETE:
-            // Solid LED off — done
             setLED(false);
             break;
     }
 }
 
 // ─────────────────────────────────────────────────────────────────
-// ESP-NOW receive callback
-// Called on a separate FreeRTOS task — keep it short.
-// Only copy data and set flag; processing happens in main loop.
+// ESP-NOW receive callback.
+// Called on a FreeRTOS task — keep it short.
+// Write data under critical section; main loop reads under the same.
 void onDataReceived(const uint8_t *mac, const uint8_t *data, int len) {
-    // Filter by hat MAC — ignore any other ESP-NOW devices
     if (memcmp(mac, hatMac, 6) != 0) return;
     if (len != sizeof(HatImuPacket)) return;
 
     HatImuPacket pkt;
     memcpy(&pkt, data, sizeof(HatImuPacket));
 
-    // Check for dropped packets via sequence number
     uint8_t expected = lastHatSeq + 1;
     if (lastHatSeq != 255 && pkt.seq != expected) {
         Serial.printf("[WARN] Dropped hat packet(s): expected %d got %d\n",
                       expected, pkt.seq);
     }
-    lastHatSeq = pkt.seq;
 
+    taskENTER_CRITICAL(&hatMux);
     hatPitch = pkt.pitch;
     hatRoll = pkt.roll;
+    lastHatSeq = pkt.seq;
     hatDataReady = true;
+    taskEXIT_CRITICAL(&hatMux);
 }
 
 // ─────────────────────────────────────────────────────────────────
@@ -307,16 +292,13 @@ void updateCarIMU() {
     int64_t nowUs = esp_timer_get_time();
     float dt = (nowUs - lastTimerUs) / 1e6f;
     lastTimerUs = nowUs;
+    if (dt <= 0.0f || dt > 0.1f) dt = SAMPLE_INTERVAL_US / 1e6f;
 
-    if (dt <= 0.0f || dt > 0.1f) dt = SAMPLE_INTERVAL_MS / 1000.0f;
-
-    float accelPitch = atan2f((float) ay, (float) az) * 180.0f / PI;
-    float accelRoll = atan2f((float) ax, (float) az) * 180.0f / PI;
-
-    // acceleration in m/s² — divide by 9.81 to get g, or use directly in atan2
+    // Adafruit library: acceleration in m/s², gyro in rad/s
     float accelPitch = atan2f(a.acceleration.y, a.acceleration.z) * 180.0f / PI;
-    // gyro in rad/s — convert to deg/s
-    float gyroPitchRate = g.gyro.x * 180.0f / PI;
+    float accelRoll = atan2f(a.acceleration.x, a.acceleration.z) * 180.0f / PI;
+    float gyroPitchRate = g.gyro.x * 180.0f / PI; // rad/s → deg/s
+    float gyroRollRate = g.gyro.y * 180.0f / PI;
 
     carPitch = ALPHA * (carPitch + gyroPitchRate * dt) + (1.0f - ALPHA) * accelPitch;
     carRoll = ALPHA * (carRoll + gyroRollRate * dt) + (1.0f - ALPHA) * accelRoll;
@@ -335,8 +317,6 @@ float getDifferentialRoll() {
 }
 
 // ─────────────────────────────────────────────────────────────────
-// Maintains a rolling buffer of recent differential pitch values.
-// Called every sample during active collection phases.
 void updatePitchHistory(float diffPitch) {
     pitchHistory[historyIndex] = diffPitch;
     historyIndex = (historyIndex + 1) % RATE_WINDOW;
@@ -345,47 +325,42 @@ void updatePitchHistory(float diffPitch) {
 
 // ─────────────────────────────────────────────────────────────────
 // Computes drop rate (deg/s) over the last RATE_WINDOW samples.
-// Uses simple linear regression slope on the history buffer.
-// Positive value = head moving forward (dropping).
-// Called at button press during Phase 2 to characterise
-// the drop leading into each nod peak.
+// Uses endpoint slope — sufficient for characterising a slow nod.
+// Positive = head moving forward (dropping).
 float computeDropRate() {
     int n = historyFull ? RATE_WINDOW : historyIndex;
     if (n < 2) return 0.0f;
 
-    // Simple slope: (last value - first value) / time_window
-    // Robust enough for 500ms window at 50Hz.
-    // Could be replaced with proper linear regression if needed.
     int firstIdx = historyFull ? historyIndex : 0;
     float first = pitchHistory[firstIdx];
     float last = pitchHistory[(historyIndex - 1 + RATE_WINDOW) % RATE_WINDOW];
     float timeWindow = (float) (n - 1) / (float) SAMPLE_RATE_HZ;
 
-    return (last - first) / timeWindow; // deg/s, positive = forward drop
+    return (last - first) / timeWindow;
 }
 
 // ─────────────────────────────────────────────────────────────────
+// Button debounce and falling-edge detection.
+// Restarts debounce timer on any raw state change; only acts once
+// the signal has been stable for 50ms.
 void handleButton() {
-    static bool lastButtonState = HIGH;
-    static unsigned long lastDebounce = 0;
-    bool currentState = digitalRead(BUTTON_PIN);
-
-    // Debounce
-    if (currentState != lastButtonState) {
-        lastDebounce = millis();
-    }
-    if (millis() - lastDebounce < 50) {
-        lastButtonState = currentState;
-        return;
-    }
-    lastButtonState = currentState;
-
-    // Only act on falling edge (press, not release)
+    static bool lastRawState = HIGH;
     static bool wasPressed = false;
-    if (currentState == LOW && !wasPressed) {
+    static unsigned long lastDebounce = 0;
+
+    bool raw = digitalRead(BUTTON_PIN);
+
+    if (raw != lastRawState) {
+        lastDebounce = millis();
+        lastRawState = raw;
+    }
+
+    if (millis() - lastDebounce < 50) return;
+
+    if (raw == LOW && !wasPressed) {
         wasPressed = true;
         onButtonPressed();
-    } else if (currentState == HIGH) {
+    } else if (raw == HIGH) {
         wasPressed = false;
     }
 }
@@ -394,7 +369,6 @@ void handleButton() {
 void onButtonPressed() {
     switch (state) {
         case STATE_WAITING:
-            // First press — begin re-zero
             Serial.println("[CAL] Starting re-zero. Sit still for 10 seconds.");
             rezeroSumPitch = 0.0;
             rezeroSumRoll = 0.0;
@@ -404,7 +378,6 @@ void onButtonPressed() {
             break;
 
         case STATE_ALERT_DONE:
-            // Press after Phase 1 complete — begin Phase 2
             Serial.println("[CAL] Phase 2: simulate drowsy nods.");
             Serial.println("      Passenger presses button at peak of each nod.");
             Serial.printf("      Need %d nods.\n", NOD_COUNT_TARGET);
@@ -415,26 +388,35 @@ void onButtonPressed() {
             state = STATE_DROWSY_COLLECT;
             break;
 
-        case STATE_DROWSY_COLLECT:
-            // Each press during Phase 2 marks a nod peak
-            if (!hatDataReady) {
+        case STATE_DROWSY_COLLECT: {
+            // Snapshot hat data under critical section
+            float localHatPitch;
+            bool gotData = false;
+            taskENTER_CRITICAL(&hatMux);
+            if (hatDataReady) {
+                localHatPitch = hatPitch;
+                gotData = true;
+            }
+            taskEXIT_CRITICAL(&hatMux);
+
+            if (!gotData) {
                 Serial.println("[WARN] No hat data yet — is hat powered on?");
                 return;
             }
-            if (nodCount < MAX_NODS) {
-                float diffPitch = getDifferentialPitch();
-                float dropRate = computeDropRate();
 
+            float diffPitch = localHatPitch - carPitch - rezeroOffsetPitch;
+            float dropRate = computeDropRate();
+
+            if (nodCount < MAX_NODS) {
                 nodPeaks[nodCount] = diffPitch;
                 nodRates[nodCount] = dropRate;
                 nodCount++;
 
                 Serial.printf("[CAL] Nod %d/%d — peak=%.2f deg, rate=%.2f deg/s\n",
                               nodCount, NOD_COUNT_TARGET, diffPitch, dropRate);
-                buzzerBeeps(1, 80, 0); // short single beep per nod
+                buzzerBeeps(1, 80, 0);
 
                 if (nodCount >= NOD_COUNT_TARGET) {
-                    // Enough nods collected — compute and save
                     Serial.println("[CAL] Nod collection complete. Saving...");
                     saveToNVS();
                     buzzerBeeps(3);
@@ -443,6 +425,7 @@ void onButtonPressed() {
                 }
             }
             break;
+        }
 
         default:
             break;
@@ -451,17 +434,23 @@ void onButtonPressed() {
 
 // ─────────────────────────────────────────────────────────────────
 void runRezero() {
-    if (!hatDataReady) return; // wait for hat packets to arrive
-    hatDataReady = false;
+    float localHatPitch, localHatRoll;
+    bool gotData = false;
+    taskENTER_CRITICAL(&hatMux);
+    if (hatDataReady) {
+        localHatPitch = hatPitch;
+        localHatRoll = hatRoll;
+        hatDataReady = false;
+        gotData = true;
+    }
+    taskEXIT_CRITICAL(&hatMux);
+    if (!gotData) return;
 
-    // Accumulate raw differential (no offset applied yet —
-    // we are computing the offset here)
-    float rawDiff = hatPitch - carPitch;
-    rezeroSumPitch += rawDiff;
-    rezeroSumRoll += (hatRoll - carRoll);
+    // Accumulate raw differential — no offset applied yet
+    rezeroSumPitch += localHatPitch - carPitch;
+    rezeroSumRoll += localHatRoll - carRoll;
     rezeroCount++;
 
-    // End of re-zero window
     if (millis() - rezeroStartMs >= REZERO_DURATION_MS) {
         rezeroOffsetPitch = (float) (rezeroSumPitch / rezeroCount);
         rezeroOffsetRoll = (float) (rezeroSumRoll / rezeroCount);
@@ -469,12 +458,12 @@ void runRezero() {
         Serial.printf("[CAL] Re-zero complete. Offset pitch=%.3f roll=%.3f\n",
                       rezeroOffsetPitch, rezeroOffsetRoll);
 
-        // Immediately begin Phase 1
-        Serial.println("[CAL] Phase 1: drive normally for 3 minutes.");
         wMeanPitch = wM2Pitch = 0.0;
         wMeanRoll = wM2Roll = 0.0;
         wCount = 0;
         alertStartMs = millis();
+
+        Serial.println("[CAL] Phase 1: drive normally for 3 minutes.");
         buzzerBeeps(1);
         state = STATE_ALERT_COLLECT;
     }
@@ -482,17 +471,23 @@ void runRezero() {
 
 // ─────────────────────────────────────────────────────────────────
 void runAlertCollect() {
-    if (!hatDataReady) return;
-    hatDataReady = false;
+    float localHatPitch, localHatRoll;
+    bool gotData = false;
+    taskENTER_CRITICAL(&hatMux);
+    if (hatDataReady) {
+        localHatPitch = hatPitch;
+        localHatRoll = hatRoll;
+        hatDataReady = false;
+        gotData = true;
+    }
+    taskEXIT_CRITICAL(&hatMux);
+    if (!gotData) return;
 
-    float diffPitch = getDifferentialPitch();
-    float diffRoll = getDifferentialRoll();
+    float diffPitch = localHatPitch - carPitch - rezeroOffsetPitch;
+    float diffRoll = localHatRoll - carRoll - rezeroOffsetRoll;
 
-    // Update pitch history for rate computation
     updatePitchHistory(diffPitch);
 
-    // Outlier rejection — discard samples from sharp turns,
-    // sudden braking, or hat adjustment
     if (fabsf(diffPitch) > OUTLIER_THRESHOLD_DEG) {
         Serial.printf("[CAL] Outlier rejected: %.2f deg\n", diffPitch);
         return;
@@ -510,16 +505,16 @@ void runAlertCollect() {
     wM2Roll += deltaRoll * (diffRoll - wMeanRoll);
 
     // Progress log every 30 seconds
-    unsigned long elapsed = millis() - alertStartMs;
     static unsigned long lastLogMs = 0;
-    if (elapsed - lastLogMs >= 30000) {
-        lastLogMs = elapsed;
+    unsigned long nowMs = millis();
+    if (nowMs - lastLogMs >= 30000) {
+        lastLogMs = nowMs;
+        unsigned long elapsed = nowMs - alertStartMs;
         Serial.printf("[CAL] Phase 1: %lu / %d seconds (%d samples)\n",
                       elapsed / 1000, ALERT_DURATION_MS / 1000, wCount);
     }
 
-    // Phase 1 complete
-    if (elapsed >= ALERT_DURATION_MS) {
+    if (millis() - alertStartMs >= ALERT_DURATION_MS) {
         float stdPitch = (wCount > 1) ? sqrtf((float) (wM2Pitch / (wCount - 1))) : 0.0f;
         float stdRoll = (wCount > 1) ? sqrtf((float) (wM2Roll / (wCount - 1))) : 0.0f;
 
@@ -530,8 +525,6 @@ void runAlertCollect() {
         Serial.printf("  std_alert_roll   = %.3f deg\n", stdRoll);
         Serial.println("  Press button to begin Phase 2 (drowsy nods).");
 
-        // Save Phase 1 results to NVS immediately —
-        // so they're not lost if Phase 2 is aborted
         prefs.begin("dd_profile", false);
         prefs.putFloat("mean_alert_pitch", (float) wMeanPitch);
         prefs.putFloat("std_alert_pitch", stdPitch);
@@ -547,20 +540,24 @@ void runAlertCollect() {
 
 // ─────────────────────────────────────────────────────────────────
 void runDrowsyCollect() {
-    if (!hatDataReady) return;
-    hatDataReady = false;
+    float localHatPitch;
+    bool gotData = false;
+    taskENTER_CRITICAL(&hatMux);
+    if (hatDataReady) {
+        localHatPitch = hatPitch;
+        hatDataReady = false;
+        gotData = true;
+    }
+    taskEXIT_CRITICAL(&hatMux);
+    if (!gotData) return;
 
-    float diffPitch = getDifferentialPitch();
-
-    // Keep history updated so drop rate is always
-    // current when button is pressed
+    float diffPitch = localHatPitch - carPitch - rezeroOffsetPitch;
     updatePitchHistory(diffPitch);
 
-    // Serial stream during Phase 2 so passenger can
-    // see the signal and judge nod peaks visually
     static unsigned long lastPrintMs = 0;
-    if (millis() - lastPrintMs > 200) {
-        lastPrintMs = millis();
+    unsigned long nowMs = millis();
+    if (nowMs - lastPrintMs > 200) {
+        lastPrintMs = nowMs;
         Serial.printf("[LIVE] diff_pitch=%.2f  nods=%d/%d\n",
                       diffPitch, nodCount, NOD_COUNT_TARGET);
     }
@@ -568,14 +565,10 @@ void runDrowsyCollect() {
 
 // ─────────────────────────────────────────────────────────────────
 void saveToNVS() {
-    // Compute mean nod peak and mean drop rate from collected nods.
-    // Simple mean — could use median for robustness but mean is
-    // sufficient for NOD_COUNT_TARGET = 8 clean samples.
     float sumPeaks = 0.0f, sumRates = 0.0f;
     for (int i = 0; i < nodCount; i++) {
         sumPeaks += nodPeaks[i];
-        sumRates += fabsf(nodRates[i]); // absolute value — rate is
-        // negative (forward drop)
+        sumRates += fabsf(nodRates[i]);
     }
     float meanDrowsyPitch = sumPeaks / nodCount;
     float meanDrowsyRate = sumRates / nodCount;
@@ -583,15 +576,12 @@ void saveToNVS() {
     Serial.println("[CAL] Drowsy calibration summary:");
     Serial.printf("  mean_drowsy_pitch = %.3f deg\n", meanDrowsyPitch);
     Serial.printf("  mean_drowsy_rate  = %.3f deg/s\n", meanDrowsyRate);
-
-    // Print all individual nod observations for post-hoc analysis
     Serial.println("  Individual nods:");
     for (int i = 0; i < nodCount; i++) {
         Serial.printf("    [%d] peak=%.2f deg  rate=%.2f deg/s\n",
                       i, nodPeaks[i], fabsf(nodRates[i]));
     }
 
-    // Save Phase 2 results — Phase 1 results already saved
     prefs.begin("dd_profile", false);
     prefs.putFloat("mean_drowsy_pitch", meanDrowsyPitch);
     prefs.putFloat("mean_drowsy_rate", meanDrowsyRate);
@@ -599,10 +589,10 @@ void saveToNVS() {
     prefs.putBool("phase2_done", true);
     prefs.end();
 
-    Serial.println("[CAL] All values saved to NVS under namespace 'dd_profile'.");
-    Serial.println("      Keys: mean_alert_pitch, std_alert_pitch,");
-    Serial.println("             mean_alert_roll,  std_alert_roll,");
-    Serial.println("             mean_drowsy_pitch, mean_drowsy_rate");
+    Serial.println("[CAL] All values saved to NVS namespace 'dd_profile'.");
+    // Serial.println("      Keys: mean_alert_pitch, std_alert_pitch,");
+    // Serial.println("             mean_alert_roll,  std_alert_roll,");
+    // Serial.println("             mean_drowsy_pitch, mean_drowsy_rate");
 }
 
 // ─────────────────────────────────────────────────────────────────
