@@ -190,8 +190,6 @@ void flashLED(int count, int onMs = 120, int offMs = 120);
 
 void setLED(bool on);
 
-void checkLongPress();
-
 // ─────────────────────────────────────────────────────────────────
 void setup() {
     Serial.begin(115200);
@@ -245,7 +243,7 @@ void setup() {
     Serial.println("  1. Sit upright, head still.");
     Serial.println("  2. Press A (Boot) → 10s baseline collection.");
     Serial.println("  3. LED solid → ready for episodes.");
-    Serial.println("  4. Let head drop → press A at onset.");
+    Serial.println("  4. Let head drop → press B at onset.");
     Serial.println("  5. At lowest point → press B (peak). 1 flash.");
     Serial.println("  6. Repeat step 4-5 for all episodes.");
     Serial.println("  7. Press A again → save and finish.");
@@ -265,7 +263,6 @@ void loop() {
     updateIMU();
     updateHistory(pitch);
     handleButtons();
-    checkLongPress();
 
     unsigned long nowMs = millis();
 
@@ -299,10 +296,10 @@ void loop() {
             static unsigned long lastLivePrint = 0;
             if (nowMs - lastLivePrint > 200) {
                 lastLivePrint = nowMs;
-                Serial.printf("[LIVE] pitch=%.2f  delta=%.2f  ep=%d\n",
-                              pitch,
-                              pitch - onsetPitch,
-                              episodeCount + 1);
+                // Serial.printf("[LIVE] pitch=%.2f  delta=%.2f  ep=%d\n",
+                // pitch,
+                // pitch - onsetPitch,
+                // episodeCount + 1);
             }
             break;
 
@@ -390,10 +387,10 @@ void runBaseline() {
         Serial.println("  LED solid = ready. Press A at onset, B at peak.");
 
         // Save baseline immediately in case of power loss
-        prefs.begin("dd_data", false);
-        prefs.putFloat("baseline_mean", baselineMean);
-        prefs.putFloat("baseline_std", baselineStd);
-        prefs.end();
+        // prefs.begin("dd_data", false);
+        // prefs.putFloat("baseline_mean", baselineMean);
+        // prefs.putFloat("baseline_std", baselineStd);
+        // prefs.end();
 
         flashLED(1);
         state = STATE_READY;
@@ -443,9 +440,7 @@ void handleButtons() {
     }
 }
 
-// Long-press A (>1500ms) from STATE_READY finalises the session.
-// Checked in handleButtons via a separate long-press detector below.
-// (Regular short press = new episode onset, as above.)
+// Used to start and end the session
 void onButtonA() {
     switch (state) {
         case STATE_IDLE:
@@ -458,6 +453,26 @@ void onButtonA() {
             state = STATE_BASELINE;
             break;
 
+        case STATE_BASELINE:
+        case STATE_READY:
+        case STATE_IN_EPISODE:
+            Serial.printf("[DONE] Finalising %d episodes.\n", episodeCount);
+            state = STATE_SAVING;
+
+            break;
+        default:
+            break;
+    }
+}
+
+// Used to mark start and end of drowsiness episode
+void onButtonB() {
+    switch (state) {
+        case STATE_IDLE:
+        case STATE_BASELINE:
+        case STATE_SAVING:
+            Serial.println("[WARN] Button B pressed outside of episode — ignored.");
+            break;
         case STATE_READY:
             if (!inEpisode) {
                 if (episodeCount == 0) {
@@ -490,74 +505,34 @@ void onButtonA() {
                 }
             }
             break;
-
         case STATE_IN_EPISODE:
-            // Pressing A during an episode is ignored — only B ends an episode
-            Serial.println("[WARN] Press B (peak button) to mark the lowest point.");
+            unsigned long peakMs = millis();
+            int durationMs = (int) (peakMs - onsetMs);
+            float peakPitch = pitch;
+
+            Episode &ep = episodes[episodeCount];
+            ep.peak_pitch = peakPitch;
+            ep.delta = peakPitch - ep.onset_pitch;
+            ep.duration_ms = durationMs;
+            ep.drop_rate = computeRateOverInterval(ep.onset_pitch, peakPitch, durationMs);
+
+            episodeCount++;
+
+            Serial.printf("[EP %d] Peak recorded.\n", episodeCount);
+            Serial.printf("  onset=%.2f deg  peak=%.2f deg\n", ep.onset_pitch, ep.peak_pitch);
+            Serial.printf("  delta=%.2f deg  duration=%d ms\n", ep.delta, ep.duration_ms);
+            Serial.printf("  drop_rate=%.2f deg/s  onset_rate=%.2f deg/s\n",
+                          ep.drop_rate, ep.onset_rate);
+            Serial.println("  Head back up. Press B for next onset.");
+
+            // Save episode immediately to NVS (non-blocking — Preferences is fine at this rate)
+            // saveEpisode(episodeCount - 1);
+
+            flashLED(1, 80, 0);
+            inEpisode = false;
+            state = STATE_READY;
             break;
-        default:
-            break;
-    }
-}
-
-void onButtonB() {
-    if (state != STATE_IN_EPISODE) {
-        Serial.println("[WARN] Button B pressed outside of episode — ignored.");
-        return;
-    }
-
-    unsigned long peakMs = millis();
-    int durationMs = (int) (peakMs - onsetMs);
-    float peakPitch = pitch;
-
-    Episode &ep = episodes[episodeCount];
-    ep.peak_pitch = peakPitch;
-    ep.delta = peakPitch - ep.onset_pitch;
-    ep.duration_ms = durationMs;
-    ep.drop_rate = computeRateOverInterval(ep.onset_pitch, peakPitch, durationMs);
-
-    episodeCount++;
-
-    Serial.printf("[EP %d] Peak recorded.\n", episodeCount);
-    Serial.printf("  onset=%.2f deg  peak=%.2f deg\n", ep.onset_pitch, ep.peak_pitch);
-    Serial.printf("  delta=%.2f deg  duration=%d ms\n", ep.delta, ep.duration_ms);
-    Serial.printf("  drop_rate=%.2f deg/s  onset_rate=%.2f deg/s\n",
-                  ep.drop_rate, ep.onset_rate);
-    Serial.println("  Head back up. Press A for next onset, or long-press A (1.5s) to finish.");
-
-    // Save episode immediately to NVS (non-blocking — Preferences is fine at this rate)
-    saveEpisode(episodeCount - 1);
-
-    flashLED(1, 80, 0);
-    inEpisode = false;
-    state = STATE_READY;
-}
-
-// ─────────────────────────────────────────────────────────────────
-// Long-press A detection: held >1500ms from STATE_READY → finalise.
-// Injected into handleButtons call above via a separate block.
-// We re-check the button state here each loop tick.
-void checkLongPress() {
-    static unsigned long pressStartMs = 0;
-    static bool counting = false;
-    static bool fired = false;
-
-    bool raw = digitalRead(BUTTON_A_PIN);
-
-    if (raw == HIGH && state == STATE_READY && !inEpisode) {
-        if (!counting) {
-            counting = true;
-            pressStartMs = millis();
-            fired = false;
-        } else if (!fired && millis() - pressStartMs >= 1500) {
-            fired = true;
-            Serial.printf("[DONE] Long-press detected. Finalising %d episodes.\n",
-                          episodeCount);
-            state = STATE_SAVING;
-        }
-    } else {
-        counting = false;
-        if (raw == LOW) fired = false;
+        default: break;
     }
 }
 
@@ -602,17 +577,13 @@ void finaliseSession() {
     Serial.println("[TIP] Suggested DD thresholds (adjust based on these numbers):");
     Serial.printf("  angle_threshold     = %.2f deg  (baseline_mean + mean_delta*0.7)\n",
                   baselineMean + (float) mDelta * 0.7f);
-    Serial.printf("  rate_threshold      = %.2f deg/s (mean_drop_rate * 0.6)\n",
-                  (float) mRate * 0.6f);
-    Serial.printf("  stillness_thresh    = %.3f deg  (baseline_std * 0.3)\n",
-                  baselineStd * 0.3f);
-    Serial.printf("  min_duration_ms     = %.0f ms  (mean_duration_ms * 0.5)\n",
-                  (float) mDur * 0.5f);
+    Serial.printf("  rate_threshold      = %.2f deg/s (mean_drop_rate * 0.6)\n", (float) mRate * 0.6f);
+    Serial.printf("  stillness_thresh    = %.3f deg  (baseline_std * 0.3)\n"baselineStd * 0.3f);
+    Serial.printf("  min_duration_ms     = %.0f ms  (mean_duration_ms * 0.5)\n", (float) mDur * 0.5f);
 
-    saveSummary((float) mDelta, stdDelta, (float) mRate, stdRate, (float) mDur, stdDur);
-
-    Serial.println("[DONE] All data saved to NVS 'dd_data'.");
-    Serial.println("       Flash DD firmware to use these thresholds.");
+    // saveSummary((float) mDelta, stdDelta, (float) mRate, stdRate, (float) mDur, stdDur);
+    // Serial.println("[DONE] All data saved to NVS 'dd_data'.");
+    // Serial.println("       Flash DD firmware to use these thresholds.");
 
     flashLED(3, 200, 150);
 }
