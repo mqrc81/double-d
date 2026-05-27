@@ -243,7 +243,7 @@ void setup() {
     Serial.println("  1. Sit upright, head still.");
     Serial.println("  2. Press A (Boot) → 10s baseline collection.");
     Serial.println("  3. LED solid → ready for episodes.");
-    Serial.println("  4. Let head drop → press A at onset.");
+    Serial.println("  4. Let head drop → press B at onset.");
     Serial.println("  5. At lowest point → press B (peak). 1 flash.");
     Serial.println("  6. Repeat step 4-5 for all episodes.");
     Serial.println("  7. Press A again → save and finish.");
@@ -296,10 +296,10 @@ void loop() {
             static unsigned long lastLivePrint = 0;
             if (nowMs - lastLivePrint > 200) {
                 lastLivePrint = nowMs;
-                Serial.printf("[LIVE] pitch=%.2f  delta=%.2f  ep=%d\n",
-                              pitch,
-                              pitch - onsetPitch,
-                              episodeCount + 1);
+                // Serial.printf("[LIVE] pitch=%.2f  delta=%.2f  ep=%d\n",
+                // pitch,
+                // pitch - onsetPitch,
+                // episodeCount + 1);
             }
             break;
 
@@ -453,6 +453,7 @@ void onButtonA() {
             state = STATE_BASELINE;
             break;
 
+        case STATE_BASELINE:
         case STATE_READY:
         case STATE_IN_EPISODE:
             Serial.printf("[DONE] Finalising %d episodes.\n", episodeCount);
@@ -468,6 +469,8 @@ void onButtonA() {
 void onButtonB() {
     switch (state) {
         case STATE_IDLE:
+        case STATE_BASELINE:
+        case STATE_SAVING:
             Serial.println("[WARN] Button B pressed outside of episode — ignored.");
             break;
         case STATE_READY:
@@ -520,7 +523,7 @@ void onButtonB() {
             Serial.printf("  delta=%.2f deg  duration=%d ms\n", ep.delta, ep.duration_ms);
             Serial.printf("  drop_rate=%.2f deg/s  onset_rate=%.2f deg/s\n",
                           ep.drop_rate, ep.onset_rate);
-            Serial.println("  Head back up. Press A for next onset, or long-press A (1.5s) to finish.");
+            Serial.println("  Head back up. Press B for next onset.");
 
             // Save episode immediately to NVS (non-blocking — Preferences is fine at this rate)
             // saveEpisode(episodeCount - 1);
