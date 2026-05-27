@@ -184,7 +184,7 @@ void finaliseSession();
 
 void saveEpisode(int idx);
 
-void saveSummary();
+void saveSummary(float a, float b, float c, float d, float e, float f);
 
 void flashLED(int count, int onMs = 120, int offMs = 120);
 
@@ -200,7 +200,7 @@ void setup() {
     pinMode(LED_PIN, OUTPUT);
     pinMode(BUTTON_A_PIN, INPUT_PULLUP);
     pinMode(BUTTON_B_PIN, INPUT_PULLUP);
-    setLED(false);
+    setLED(true);
 
     Wire.begin(SDA_PIN, SCL_PIN);
     if (!mpu.begin()) {
@@ -406,7 +406,7 @@ void runBaseline() {
 void handleButtons() {
     // ── Button A ──
     {
-        static bool lastRaw = HIGH, wasPressed = false;
+        static bool lastRaw = LOW, wasPressed = false;
         static unsigned long lastDebounce = 0;
         bool raw = digitalRead(BUTTON_A_PIN);
         if (raw != lastRaw) {
@@ -414,10 +414,10 @@ void handleButtons() {
             lastRaw = raw;
         }
         if (millis() - lastDebounce >= 50) {
-            if (raw == LOW && !wasPressed) {
+            if (raw == HIGH && !wasPressed) {
                 wasPressed = true;
                 onButtonA();
-            } else if (raw == HIGH) {
+            } else if (raw == LOW) {
                 wasPressed = false;
             }
         }
@@ -425,7 +425,7 @@ void handleButtons() {
 
     // ── Button B ──
     {
-        static bool lastRaw = HIGH, wasPressed = false;
+        static bool lastRaw = LOW, wasPressed = false;
         static unsigned long lastDebounce = 0;
         bool raw = digitalRead(BUTTON_B_PIN);
         if (raw != lastRaw) {
@@ -433,10 +433,10 @@ void handleButtons() {
             lastRaw = raw;
         }
         if (millis() - lastDebounce >= 50) {
-            if (raw == LOW && !wasPressed) {
+            if (raw == HIGH && !wasPressed) {
                 wasPressed = true;
                 onButtonB();
-            } else if (raw == HIGH) {
+            } else if (raw == LOW) {
                 wasPressed = false;
             }
         }
@@ -495,8 +495,6 @@ void onButtonA() {
             // Pressing A during an episode is ignored — only B ends an episode
             Serial.println("[WARN] Press B (peak button) to mark the lowest point.");
             break;
-
-        case STATE_READY + 0:
         default:
             break;
     }
@@ -546,7 +544,7 @@ void checkLongPress() {
 
     bool raw = digitalRead(BUTTON_A_PIN);
 
-    if (raw == LOW && state == STATE_READY && !inEpisode) {
+    if (raw == HIGH && state == STATE_READY && !inEpisode) {
         if (!counting) {
             counting = true;
             pressStartMs = millis();
@@ -559,7 +557,7 @@ void checkLongPress() {
         }
     } else {
         counting = false;
-        if (raw == HIGH) fired = false;
+        if (raw == LOW) fired = false;
     }
 }
 
