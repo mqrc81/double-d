@@ -190,8 +190,6 @@ void flashLED(int count, int onMs = 120, int offMs = 120);
 
 void setLED(bool on);
 
-void checkLongPress();
-
 // ─────────────────────────────────────────────────────────────────
 void setup() {
     Serial.begin(115200);
@@ -265,7 +263,6 @@ void loop() {
     updateIMU();
     updateHistory(pitch);
     handleButtons();
-    checkLongPress();
 
     unsigned long nowMs = millis();
 
@@ -443,9 +440,7 @@ void handleButtons() {
     }
 }
 
-// Long-press A (>1500ms) from STATE_READY finalises the session.
-// Checked in handleButtons via a separate long-press detector below.
-// (Regular short press = new episode onset, as above.)
+// Used to start and end the session
 void onButtonA() {
     switch (state) {
         case STATE_IDLE:
@@ -458,6 +453,23 @@ void onButtonA() {
             state = STATE_BASELINE;
             break;
 
+        case STATE_READY:
+        case STATE_IN_EPISODE:
+            Serial.printf("[DONE] Finalising %d episodes.\n", episodeCount);
+            state = STATE_SAVING;
+
+            break;
+        default:
+            break;
+    }
+}
+
+// Used to mark start and end of drowsiness episode
+void onButtonB() {
+    switch (state) {
+        case STATE_IDLE:
+            Serial.println("[WARN] Button B pressed outside of episode — ignored.");
+            break;
         case STATE_READY:
             if (!inEpisode) {
                 if (episodeCount == 0) {
@@ -490,76 +502,34 @@ void onButtonA() {
                 }
             }
             break;
-
         case STATE_IN_EPISODE:
-            // Pressing A during an episode is ignored — only B ends an episode
-            Serial.println("[WARN] Press B (peak button) to mark the lowest point.");
+            unsigned long peakMs = millis();
+            int durationMs = (int) (peakMs - onsetMs);
+            float peakPitch = pitch;
+
+            Episode &ep = episodes[episodeCount];
+            ep.peak_pitch = peakPitch;
+            ep.delta = peakPitch - ep.onset_pitch;
+            ep.duration_ms = durationMs;
+            ep.drop_rate = computeRateOverInterval(ep.onset_pitch, peakPitch, durationMs);
+
+            episodeCount++;
+
+            Serial.printf("[EP %d] Peak recorded.\n", episodeCount);
+            Serial.printf("  onset=%.2f deg  peak=%.2f deg\n", ep.onset_pitch, ep.peak_pitch);
+            Serial.printf("  delta=%.2f deg  duration=%d ms\n", ep.delta, ep.duration_ms);
+            Serial.printf("  drop_rate=%.2f deg/s  onset_rate=%.2f deg/s\n",
+                          ep.drop_rate, ep.onset_rate);
+            Serial.println("  Head back up. Press A for next onset, or long-press A (1.5s) to finish.");
+
+            // Save episode immediately to NVS (non-blocking — Preferences is fine at this rate)
+            saveEpisode(episodeCount - 1);
+
+            flashLED(1, 80, 0);
+            inEpisode = false;
+            state = STATE_READY;
             break;
-
-        case STATE_READY + 0:
-        default:
-            break;
-    }
-}
-
-void onButtonB() {
-    if (state != STATE_IN_EPISODE) {
-        Serial.println("[WARN] Button B pressed outside of episode — ignored.");
-        return;
-    }
-
-    unsigned long peakMs = millis();
-    int durationMs = (int) (peakMs - onsetMs);
-    float peakPitch = pitch;
-
-    Episode &ep = episodes[episodeCount];
-    ep.peak_pitch = peakPitch;
-    ep.delta = peakPitch - ep.onset_pitch;
-    ep.duration_ms = durationMs;
-    ep.drop_rate = computeRateOverInterval(ep.onset_pitch, peakPitch, durationMs);
-
-    episodeCount++;
-
-    Serial.printf("[EP %d] Peak recorded.\n", episodeCount);
-    Serial.printf("  onset=%.2f deg  peak=%.2f deg\n", ep.onset_pitch, ep.peak_pitch);
-    Serial.printf("  delta=%.2f deg  duration=%d ms\n", ep.delta, ep.duration_ms);
-    Serial.printf("  drop_rate=%.2f deg/s  onset_rate=%.2f deg/s\n",
-                  ep.drop_rate, ep.onset_rate);
-    Serial.println("  Head back up. Press A for next onset, or long-press A (1.5s) to finish.");
-
-    // Save episode immediately to NVS (non-blocking — Preferences is fine at this rate)
-    saveEpisode(episodeCount - 1);
-
-    flashLED(1, 80, 0);
-    inEpisode = false;
-    state = STATE_READY;
-}
-
-// ─────────────────────────────────────────────────────────────────
-// Long-press A detection: held >1500ms from STATE_READY → finalise.
-// Injected into handleButtons call above via a separate block.
-// We re-check the button state here each loop tick.
-void checkLongPress() {
-    static unsigned long pressStartMs = 0;
-    static bool counting = false;
-    static bool fired = false;
-
-    bool raw = digitalRead(BUTTON_A_PIN);
-
-    if (raw == LOW && state == STATE_READY && !inEpisode) {
-        if (!counting) {
-            counting = true;
-            pressStartMs = millis();
-            fired = false;
-        } else if (!fired && millis() - pressStartMs >= 1500) {
-            fired = true;
-            Serial.printf("[DONE] Long-press detected. Finalising %d episodes.\n",
-                          episodeCount);
-            state = STATE_SAVING;
-        }
-    } else {
-        counting = false;
-        if (raw == HIGH) fired = false;
+        default: break;
     }
 }
 
