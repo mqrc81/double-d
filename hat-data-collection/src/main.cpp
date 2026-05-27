@@ -473,6 +473,7 @@ void onButtonB() {
         case STATE_SAVING:
             Serial.println("[WARN] Button B pressed outside of episode — ignored.");
             break;
+
         case STATE_READY:
             if (!inEpisode) {
                 if (episodeCount == 0) {
@@ -505,6 +506,7 @@ void onButtonB() {
                 }
             }
             break;
+
         case STATE_IN_EPISODE:
             unsigned long peakMs = millis();
             int durationMs = (int) (peakMs - onsetMs);
@@ -532,7 +534,6 @@ void onButtonB() {
             inEpisode = false;
             state = STATE_READY;
             break;
-        default: break;
     }
 }
 
@@ -578,7 +579,7 @@ void finaliseSession() {
     Serial.printf("  angle_threshold     = %.2f deg  (baseline_mean + mean_delta*0.7)\n",
                   baselineMean + (float) mDelta * 0.7f);
     Serial.printf("  rate_threshold      = %.2f deg/s (mean_drop_rate * 0.6)\n", (float) mRate * 0.6f);
-    Serial.printf("  stillness_thresh    = %.3f deg  (baseline_std * 0.3)\n"baselineStd * 0.3f);
+    Serial.printf("  stillness_thresh    = %.3f deg  (baseline_std * 0.3)\n", baselineStd * 0.3f);
     Serial.printf("  min_duration_ms     = %.0f ms  (mean_duration_ms * 0.5)\n", (float) mDur * 0.5f);
 
     // saveSummary((float) mDelta, stdDelta, (float) mRate, stdRate, (float) mDur, stdDur);
