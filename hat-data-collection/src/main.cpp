@@ -387,10 +387,10 @@ void runBaseline() {
         Serial.println("  LED solid = ready. Press A at onset, B at peak.");
 
         // Save baseline immediately in case of power loss
-        prefs.begin("dd_data", false);
-        prefs.putFloat("baseline_mean", baselineMean);
-        prefs.putFloat("baseline_std", baselineStd);
-        prefs.end();
+        // prefs.begin("dd_data", false);
+        // prefs.putFloat("baseline_mean", baselineMean);
+        // prefs.putFloat("baseline_std", baselineStd);
+        // prefs.end();
 
         flashLED(1);
         state = STATE_READY;
@@ -523,7 +523,7 @@ void onButtonB() {
             Serial.println("  Head back up. Press A for next onset, or long-press A (1.5s) to finish.");
 
             // Save episode immediately to NVS (non-blocking — Preferences is fine at this rate)
-            saveEpisode(episodeCount - 1);
+            // saveEpisode(episodeCount - 1);
 
             flashLED(1, 80, 0);
             inEpisode = false;
