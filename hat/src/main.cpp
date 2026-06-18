@@ -7,7 +7,6 @@
 
 // ── PINS ─────────────────────────────────────────────────────────
 #define INTERRUPT_PIN  2
-#define BUTTON_PIN     13   // active LOW, internal pull-up — triggers calibration
 #define BUZZER_PIN     23
 
 // ── BUZZER ───────────────────────────────────────────────────────
@@ -84,9 +83,10 @@ unsigned long calibrationStartTime = 0;
 float pitchSum = 0.0f;
 int calibsampleCount = 0;
 
-// Calibration is triggered by the hat's own button (GPIO 13).
+// Calibration triggers automatically at end of DMP warmup.
 // 5 s window, minimum 50 still samples required.
-// See DC doc CALIBRATION_DURATION_MS / CALIBRATION_SAMPLES_REQUIRED entries.
+// Sit in natural upright driving posture during the 30 s warmup —
+// calibration begins immediately after without any user action.
 #define CALIBRATION_DURATION_MS      5000
 #define CALIBRATION_SAMPLES_REQUIRED 50
 #define CALIB_RATE_GATE              5.0f  // °/s — stillness gate
@@ -97,11 +97,6 @@ int calibsampleCount = 0;
 // ── MPU INTERRUPT ────────────────────────────────────────────────
 volatile bool mpuInterrupt = false;
 void dmpDataReady() { mpuInterrupt = true; }
-
-// ── BUTTON DEBOUNCE ───────────────────────────────────────────────
-bool lastBtn = HIGH;
-unsigned long lastDebounce = 0;
-#define DEBOUNCE_MS  50
 
 // ── CALIBRATION FUNCTIONS ─────────────────────────────────────────
 void startCalibration() {
@@ -150,7 +145,6 @@ void setup() {
 
     pinMode(BUZZER_PIN, OUTPUT);
     noTone(BUZZER_PIN);
-    pinMode(BUTTON_PIN, INPUT_PULLUP);
 
 #if I2CDEV_IMPLEMENTATION == I2CDEV_ARDUINO_WIRE
     Wire.begin(21, 22);
@@ -204,9 +198,12 @@ void setup() {
             mpu.dmpGetYawPitchRoll(ypr, &q, &gravity);
         }
     }
-    Serial.println("Warmup complete — press button to calibrate");
-    // single short beep: warmup done, waiting for calibration
+    Serial.println("Warmup complete — starting calibration automatically.");
+    Serial.println("Sit in natural upright driving posture and hold still for 5 seconds.");
+    // single beep: warmup done, calibration starting
     beep(100);
+    delay(110); // let beep finish before calibration sampling begins
+    startCalibration();
 }
 
 // ── LOOP ──────────────────────────────────────────────────────────
@@ -247,20 +244,6 @@ void loop() {
     lastRoll = roll;
     lastSampleTime = now;
 
-    // ── button debounce ───────────────────────────────────────────
-    bool btnNow = digitalRead(BUTTON_PIN);
-    bool btnPressed = false;
-    if (btnNow == LOW && lastBtn == HIGH && (now - lastDebounce > DEBOUNCE_MS)) {
-        lastDebounce = now;
-        btnPressed = true;
-    }
-    lastBtn = btnNow;
-
-    // ── calibration trigger ───────────────────────────────────────
-    if (btnPressed && !calibrationInProgress) {
-        startCalibration();
-    }
-
     // ── calibration in progress ───────────────────────────────────
     if (calibrationInProgress) {
         performCalibration(pitch, totalRate);
@@ -283,17 +266,6 @@ void loop() {
         }
 
         return; // skip detection while calibrating
-    }
-
-    // ── waiting for calibration ───────────────────────────────────
-    if (!isCalibrated) {
-        // single short beep every 2 s — gentle reminder
-        static unsigned long lastWaitBeep = 0;
-        if (now - lastWaitBeep > 2000) {
-            lastWaitBeep = now;
-            beep(80);
-        }
-        return;
     }
 
     // standalone mode: no bump suppression, no hill compensation
