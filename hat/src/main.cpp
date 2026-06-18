@@ -1,7 +1,5 @@
 #include "I2Cdev.h"
-#include <esp_now.h>
 #include "MPU6050_6Axis_MotionApps20.h"
-#include "WiFi.h"
 
 #if I2CDEV_IMPLEMENTATION == I2CDEV_ARDUINO_WIRE
 #include "Wire.h"
@@ -9,7 +7,8 @@
 
 // ── PINS ─────────────────────────────────────────────────────────
 #define INTERRUPT_PIN  2
-#define BUZZER_PIN     13
+#define BUTTON_PIN     13   // active LOW, internal pull-up — triggers calibration
+#define BUZZER_PIN     23
 
 // ── BUZZER ───────────────────────────────────────────────────────
 // Requires a passive buzzer (cicalino passivo).
@@ -85,7 +84,7 @@ unsigned long calibrationStartTime = 0;
 float pitchSum = 0.0f;
 int calibsampleCount = 0;
 
-// Calibration is triggered by EVENT_BUTTON from the car unit.
+// Calibration is triggered by the hat's own button (GPIO 13).
 // 5 s window, minimum 50 still samples required.
 // See DC doc CALIBRATION_DURATION_MS / CALIBRATION_SAMPLES_REQUIRED entries.
 #define CALIBRATION_DURATION_MS      5000
@@ -95,42 +94,14 @@ int calibsampleCount = 0;
 // at 20 Hz (~0.022°/s). Any rejected sample reflects real movement.
 // Source: InvenSense PS-MPU-6000A gyro noise density ~0.005°/s/√Hz.
 
-// ── ESP-NOW ───────────────────────────────────────────────────────
-// Car unit MAC — update to actual car MAC before flashing
-uint8_t carMAC[] = {0x20, 0xE7, 0xC8, 0xBB, 0x16, 0xC0};
-
-typedef struct {
-    uint8_t eventType;
-    float magnitude;
-} ShoulderMessage;
-
-#define EVENT_BUTTON    1
-#define EVENT_BUMP      2
-#define EVENT_ROAD_TILT 3
-
-ShoulderMessage msgIn;
-
-volatile bool newCalibRequest = false;
-volatile unsigned long bumpTimestamp = 0xFFFFFFFF;
-volatile float roadAngle = 0.0f;
-
 // ── MPU INTERRUPT ────────────────────────────────────────────────
 volatile bool mpuInterrupt = false;
 void dmpDataReady() { mpuInterrupt = true; }
 
-// ── ESP-NOW RECEIVE CALLBACK ──────────────────────────────────────
-void onDataReceived(const uint8_t *mac, const uint8_t *data, int len) {
-    if (len != sizeof(ShoulderMessage)) return;
-    memcpy(&msgIn, data, sizeof(ShoulderMessage));
-    switch (msgIn.eventType) {
-        case EVENT_BUTTON: newCalibRequest = true;
-            break;
-        case EVENT_BUMP: bumpTimestamp = millis();
-            break;
-        case EVENT_ROAD_TILT: roadAngle = msgIn.magnitude;
-            break;
-    }
-}
+// ── BUTTON DEBOUNCE ───────────────────────────────────────────────
+bool lastBtn = HIGH;
+unsigned long lastDebounce = 0;
+#define DEBOUNCE_MS  50
 
 // ── CALIBRATION FUNCTIONS ─────────────────────────────────────────
 void startCalibration() {
@@ -179,6 +150,7 @@ void setup() {
 
     pinMode(BUZZER_PIN, OUTPUT);
     noTone(BUZZER_PIN);
+    pinMode(BUTTON_PIN, INPUT_PULLUP);
 
 #if I2CDEV_IMPLEMENTATION == I2CDEV_ARDUINO_WIRE
     Wire.begin(21, 22);
@@ -186,16 +158,6 @@ void setup() {
 #elif I2CDEV_IMPLEMENTATION == I2CDEV_BUILTIN_FASTWIRE
     Fastwire::setup(400, true);
 #endif
-
-    WiFi.mode(WIFI_MODE_STA);
-    if (esp_now_init() != ESP_OK) {
-        Serial.println("ERROR: ESP-NOW init failed");
-        return;
-    }
-    Serial.print("MAC Address: ");
-    Serial.println(WiFi.macAddress());
-
-    esp_now_register_recv_cb(onDataReceived);
 
     Serial.println(F("Initializing I2C devices..."));
     mpu.initialize();
@@ -242,7 +204,7 @@ void setup() {
             mpu.dmpGetYawPitchRoll(ypr, &q, &gravity);
         }
     }
-    Serial.println("Warmup complete — press car button to calibrate");
+    Serial.println("Warmup complete — press button to calibrate");
     // single short beep: warmup done, waiting for calibration
     beep(100);
 }
@@ -285,14 +247,17 @@ void loop() {
     lastRoll = roll;
     lastSampleTime = now;
 
-    // ── calibration trigger from car button ───────────────────────
-    bool doCalibrate = false;
-    if (newCalibRequest) {
-        newCalibRequest = false;
-        doCalibrate = true;
+    // ── button debounce ───────────────────────────────────────────
+    bool btnNow = digitalRead(BUTTON_PIN);
+    bool btnPressed = false;
+    if (btnNow == LOW && lastBtn == HIGH && (now - lastDebounce > DEBOUNCE_MS)) {
+        lastDebounce = now;
+        btnPressed = true;
     }
+    lastBtn = btnNow;
 
-    if (doCalibrate && !calibrationInProgress) {
+    // ── calibration trigger ───────────────────────────────────────
+    if (btnPressed && !calibrationInProgress) {
         startCalibration();
     }
 
@@ -331,16 +296,9 @@ void loop() {
         return;
     }
 
-    // ── shoulder data processing ──────────────────────────────────
-    // isBump: true if car unit reported a road jolt within last 200 ms.
-    // 200 ms = P80(bump duration) + 50 ms margin (pending DC2 confirmation).
-    bool isBump = (now - bumpTimestamp) < 200;
-
-    // hillOffset: loosen pitch threshold proportionally to road gradient.
-    // Factor 0.8 is a placeholder — replace with mean(ratio) from DC3.
-    // Cap pending DC3: revisit after real hill data confirms max gradient.
-    float hillOffset = min(fabsf(roadAngle) * 0.8f, 15.0f);
-    float activePitchThresh = PITCH_THRESHOLD + hillOffset;
+    // standalone mode: no bump suppression, no hill compensation
+    const bool isBump = false;
+    const float activePitchThresh = PITCH_THRESHOLD;
 
     // ── slow baseline drift correction ───────────────────────────
     // Only when driver is still and no alarm is active.
@@ -402,16 +360,12 @@ void loop() {
     sampleCount++;
     if (sampleCount >= 10) {
         sampleCount = 0;
-        Serial.print("RAW p:");
+        Serial.print("p:");
         Serial.print(pitch, 2);
         Serial.print("  rel:");
         Serial.print(relativePitch, 2);
         Serial.print(" rate:");
         Serial.print(totalRate, 2);
-        Serial.print(" bump:");
-        Serial.print(isBump);
-        Serial.print(" hill:");
-        Serial.print(roadAngle, 2);
         Serial.print(" thresh:");
         Serial.print(activePitchThresh, 2);
         Serial.print(" triggered:");
