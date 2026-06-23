@@ -45,8 +45,8 @@ int   recoveryCount  = 0;
 int  alarmCount    = 0;
 volatile bool alarmActive = false;
 const int   RECOVERY_LIMIT = 5;        // samples below threshold before reset
-const float PITCH_THRESHOLD  = 3.0;   // must exceed this to start alarm
-const float PITCH_RECOVERY   = 2.0;   // only needs to drop below this to cancel
+const float PITCH_THRESHOLD  = 4.0;   // must exceed this to start alarm
+const float PITCH_RECOVERY   = 3.0;   // only needs to drop below this to cancel
 const float BASELINE_CORRECTION_RATE = 0.001f;
 
 typedef struct {
