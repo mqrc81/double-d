@@ -1,354 +1,430 @@
 #include "I2Cdev.h"
+#include <esp_now.h>
 #include "MPU6050_6Axis_MotionApps20.h"
+#include "WiFi.h"
 
 #if I2CDEV_IMPLEMENTATION == I2CDEV_ARDUINO_WIRE
-#include "Wire.h"
+    #include "Wire.h"
 #endif
 
-// ── PINS ─────────────────────────────────────────────────────────
-#define INTERRUPT_PIN  2
-#define BUZZER_PIN     23
 
-// ── BUZZER ───────────────────────────────────────────────────────
-// Requires a passive buzzer (cicalino passivo).
-// tone()/noTone() drive a square wave — active buzzers are
-// incompatible and will only click.
-#define BUZZER_FREQ    2000   // Hz — 2 kHz tone
-
-// Non-blocking buzzer: set buzzerOnUntil to schedule a tone burst.
-// The buzzer control block at the top of loop() handles on/off.
-unsigned long buzzerOnUntil = 0;
-
-// Helper: start a tone burst of durationMs without blocking.
-void beep(unsigned long durationMs) {
-    tone(BUZZER_PIN, BUZZER_FREQ);
-    buzzerOnUntil = millis() + durationMs;
-}
-
-// ── MPU ───────────────────────────────────────────────────────────
 MPU6050 mpu;
 
 #define OUTPUT_READABLE_YAWPITCHROLL
 
-bool dmpReady = false;
-uint8_t mpuIntStatus;
-uint8_t devStatus;
-uint16_t packetSize;
-uint16_t fifoCount;
-uint8_t fifoBuffer[64];
+#define INTERRUPT_PIN 2  
+#define BUZZER_PIN    13 
+#define BUZZER_FREQ   2000
+// Calibration Variables
+float baselinePitch = 0;
+bool isCalibrated = false;
+bool calibrationInProgress = false;
 
-Quaternion q;
-VectorInt16 aa;
-VectorInt16 aaReal;
-VectorInt16 aaWorld;
-VectorFloat gravity;
-float euler[3];
-float ypr[3];
+unsigned long calibrationStartTime = 0;
+#define CALIBRATION_DURATION_MS 5000   // 5 seconds of sampling
+#define CALIBRATION_SAMPLES_REQUIRED 50
 
-// ── DETECTION THRESHOLDS ─────────────────────────────────────────
-const float PITCH_THRESHOLD = 19.0f; // ° — triggers alarm
-const float PITCH_RECOVERY = 10.0f; // ° — cancels alarm (hysteresis)
-const float BASELINE_CORRECTION_RATE = 0.001f; // ~50 s time constant at 20 Hz
-// See DC doc: time constant intentionally > max microsleep duration
-// (~30 s, Harrison & Horne 1996) so a genuine drowsy slump cannot
-// erase itself from the baseline before the alarm fires.
+float pitchSum = 0;
+int calibsampleCount = 0;
 
-const int RECOVERY_LIMIT = 5; // samples below threshold before reset
-// At 20 Hz, 5 samples = 250 ms confirmation window.
+// MPU control/status vars
+bool dmpReady = false;  // set true if DMP init was successful
+uint8_t devStatus;      // return status after each device operation (0 = success, !0 = error)
+uint16_t packetSize;    // expected DMP packet size (default is 42 bytes)
+uint8_t fifoBuffer[64]; // FIFO storage buffer
 
-// ── DETECTION STATE ───────────────────────────────────────────────
-unsigned long lastTime = 0;
+// orientation/motion vars
+Quaternion q;           // [w, x, y, z]         quaternion container
+VectorFloat gravity;    // [x, y, z]            gravity vector
+float ypr[3];           // [yaw, pitch, roll]   yaw/pitch/roll container and gravity vector
+
 int sampleCount = 0;
 unsigned long tiltStartTime = 0;
 bool tiltActive = false;
-int recoveryCount = 0;
-int alarmCount = 0;
-static bool alarmFired = false;
+int   recoveryCount  = 0;
+int  alarmCount    = 0;
+volatile bool alarmActive = false;
+const int   RECOVERY_LIMIT = 5;        // samples below threshold before reset
+const float PITCH_THRESHOLD  = 3.0;   // must exceed this to start alarm
+const float PITCH_RECOVERY   = 2.0;   // only needs to drop below this to cancel
+const float BASELINE_CORRECTION_RATE = 0.001f;
 
-// ── ALARM LADDER ─────────────────────────────────────────────────
-// Escalating confirmation time after repeated alarms.
-// First event: 1500 ms (risk-stratified; pending DC1 floor confirmation).
-// See DC doc ALARM_DURATION_MS entry for justification.
-inline unsigned long effectiveAlarmMs() {
-    if (alarmCount == 0) return 1500;
-    if (alarmCount == 1) return 1000;
-    return 700;
+typedef struct {
+    uint8_t eventType;
+    float   magnitude;
+} ShoulderMessage;
+uint8_t broadcastadd[] = {0x20, 0xE7, 0xC8, 0xBB, 0x16, 0xC0};
+
+#define EVENT_BUTTON    1
+#define EVENT_BUMP      2
+#define EVENT_ROAD_TILT 3
+
+ShoulderMessage msgIn;
+
+volatile bool          newCalibRequest = false;
+volatile unsigned long bumpTimestamp   = 0xFFFFFFFF;
+volatile float         roadAngle       = 0;
+
+// INTERRUPT DETECTION ROUTINE
+
+volatile bool mpuInterrupt = false;     // indicates whether MPU interrupt pin has gone high
+void dmpDataReady() {
+    mpuInterrupt = true;
 }
 
-// ── CALIBRATION ───────────────────────────────────────────────────
-float baselinePitch = 0.0f;
-bool isCalibrated = false;
-bool calibrationInProgress = false;
-unsigned long calibrationStartTime = 0;
-float pitchSum = 0.0f;
-int calibsampleCount = 0;
+void buzzerTask(void* pvParameters) {
+    pinMode(BUZZER_PIN, OUTPUT);
+    bool lastState = false;
 
-// Calibration triggers automatically at end of DMP warmup.
-// 5 s window, minimum 50 still samples required.
-// Sit in natural upright driving posture during the 30 s warmup —
-// calibration begins immediately after without any user action.
-#define CALIBRATION_DURATION_MS      5000
-#define CALIBRATION_SAMPLES_REQUIRED 50
-#define CALIB_RATE_GATE              5.0f  // °/s — stillness gate
-// CALIB_RATE_GATE: 5°/s is ~225× above the MPU-6050 noise-induced rate
-// at 20 Hz (~0.022°/s). Any rejected sample reflects real movement.
-// Source: InvenSense PS-MPU-6000A gyro noise density ~0.005°/s/√Hz.
-
-// ── MPU INTERRUPT ────────────────────────────────────────────────
-volatile bool mpuInterrupt = false;
-void dmpDataReady() { mpuInterrupt = true; }
-
-// ── CALIBRATION FUNCTIONS ─────────────────────────────────────────
-void startCalibration() {
-    if (calibrationInProgress) return;
-    Serial.println("=== CALIBRATION STARTED ===");
-    Serial.println("Keep head perfectly still for 5 seconds!");
-    calibrationInProgress = true;
-    pitchSum = 0.0f;
-    sampleCount = 0;
-    calibsampleCount = 0;
-    baselinePitch = 0.0f;
-    calibrationStartTime = millis();
-}
-
-void performCalibration(float pitch, float totalRate) {
-    if (!calibrationInProgress) return;
-
-    if (millis() - calibrationStartTime < CALIBRATION_DURATION_MS) {
-        if (totalRate < CALIB_RATE_GATE) {
-            pitchSum += pitch;
-            calibsampleCount++;
+    for (;;) {
+        bool current = alarmActive;
+        if (current && !lastState) {
+            tone(BUZZER_PIN, BUZZER_FREQ);
+        } else if (!current && lastState) {
+            noTone(BUZZER_PIN);
         }
-    } else {
-        if (calibsampleCount >= CALIBRATION_SAMPLES_REQUIRED) {
-            baselinePitch = pitchSum / calibsampleCount;
-            isCalibrated = true;
-            calibrationInProgress = false;
-            Serial.println("=== CALIBRATION COMPLETE ===");
-            Serial.print("Samples: ");
-            Serial.println(calibsampleCount);
-            Serial.print("Baseline Pitch: ");
-            Serial.println(baselinePitch, 2);
-            // two long beeps = calibration success
-            beep(400); // second beep scheduled in loop via lastBeepPattern
-        } else {
-            calibrationInProgress = false;
-            Serial.println("Calibration failed — insufficient still samples!");
-            // three short fast beeps = failure (scheduled below)
-        }
+        lastState = current;
+        vTaskDelay(pdMS_TO_TICKS(10));
     }
 }
 
-// ── SETUP ─────────────────────────────────────────────────────────
+void onDataReceived(const uint8_t *mac,
+                    const uint8_t *data, int len) {
+    if (len != sizeof(ShoulderMessage)) return;
+    memcpy(&msgIn, data, sizeof(ShoulderMessage));
+
+    switch (msgIn.eventType) {
+        case EVENT_BUTTON:
+            newCalibRequest = true;
+            break;
+        case EVENT_BUMP:
+            bumpTimestamp = millis();
+            break;
+        case EVENT_ROAD_TILT:
+            roadAngle = msgIn.magnitude;
+            break;
+    }
+}
+
+// INITIAL SETUP
+
+
 void setup() {
     Serial.begin(115200);
 
-    pinMode(BUZZER_PIN, OUTPUT);
-    noTone(BUZZER_PIN);
+    xTaskCreatePinnedToCore(
+        buzzerTask, "buzzerTask", 1024, NULL, 1, NULL, 0
+    );
 
-#if I2CDEV_IMPLEMENTATION == I2CDEV_ARDUINO_WIRE
-    Wire.begin(21, 22);
-    Wire.setClock(400000);
-#elif I2CDEV_IMPLEMENTATION == I2CDEV_BUILTIN_FASTWIRE
-    Fastwire::setup(400, true);
-#endif
+    #if I2CDEV_IMPLEMENTATION == I2CDEV_ARDUINO_WIRE
+        Wire.begin();
+        Wire.setClock(400000);
+    #elif I2CDEV_IMPLEMENTATION == I2CDEV_BUILTIN_FASTWIRE
+        Fastwire::setup(400, true);
+    #endif
 
+    WiFi.mode(WIFI_MODE_STA);
+    if (esp_now_init() != ESP_OK){
+        Serial.println("Error initializing ESP-NOW");
+        return;
+    }
+    Serial.print("MAC Address: ");
+    Serial.print(WiFi.macAddress());
+    Serial.print("\n");
+
+    // initialize device
     Serial.println(F("Initializing I2C devices..."));
     mpu.initialize();
     pinMode(INTERRUPT_PIN, INPUT);
-    Serial.println(mpu.testConnection()
-                       ? F("MPU6050 connection successful")
-                       : F("MPU6050 connection failed"));
+    // verify connection
+    Serial.println(F("Testing device connections..."));
+    Serial.println(mpu.testConnection() ? F("MPU6050 connection successful") : F("MPU6050 connection failed"));
 
+    // load and configure the DMP
     Serial.println(F("Initializing DMP..."));
     devStatus = mpu.dmpInitialize();
 
+    // making sur it worked
     if (devStatus == 0) {
+        // Calibration Time: generate offsets and calibrate our MPU6050
         mpu.CalibrateAccel(6);
         mpu.CalibrateGyro(6);
-        mpu.setRate(49); // 20 Hz — DMP output = 1000/(1+49)
+
+        mpu.setRate(49); // sampling rate set to 20Hz
         mpu.PrintActiveOffsets();
         Serial.println(F("Enabling DMP..."));
         mpu.setDMPEnabled(true);
-        mpuIntStatus = mpu.getIntStatus();
-        Serial.print(F("Enabling interrupt detection (pin "));
+
+        // enable Arduino interrupt detection
+        Serial.print(F("Enabling interrupt detection (Arduino external interrupt "));
         Serial.print(digitalPinToInterrupt(INTERRUPT_PIN));
         Serial.println(F(")..."));
         attachInterrupt(digitalPinToInterrupt(INTERRUPT_PIN), dmpDataReady, RISING);
+
+        // get our DMP Ready flag so the main loop() function knows it's okay to use it
+        Serial.println(F("DMP ready! Waiting for first interrupt..."));
         dmpReady = true;
+
+        // get expected DMP packet size for later comparison
         packetSize = mpu.dmpGetFIFOPacketSize();
         Serial.println("DMP ready!");
         Serial.print("Packet size: ");
         Serial.println(packetSize);
     } else {
+        // ERROR!
+        // 1 = initial memory load failed
+        // 2 = DMP configuration updates failed
+        // (if it's going to break, usually the code will be 1)
         Serial.print(F("DMP Initialization failed (code "));
         Serial.print(devStatus);
         Serial.println(F(")"));
     }
+    // Register the receive callback
+    esp_now_register_recv_cb(onDataReceived);
 
-    // ── 30 s DMP warmup ──────────────────────────────────────────
-    // InvenSense AN-MPU-6000A-03: DMP complementary filter requires
-    // 20–30 s to converge from cold start. Silent during warmup.
     Serial.println("Warming up DMP — please wait 30 seconds...");
     unsigned long warmupStart = millis();
     while (millis() - warmupStart < 30000) {
+        // keep reading packets so DMP filter converges
+        // change it to 10 when testing because it is taking to long
         if (mpu.dmpGetCurrentFIFOPacket(fifoBuffer)) {
             mpu.dmpGetQuaternion(&q, fifoBuffer);
             mpu.dmpGetGravity(&gravity, &q);
             mpu.dmpGetYawPitchRoll(ypr, &q, &gravity);
         }
+        delay(1); // this is for the wire error
     }
-    Serial.println("Warmup complete — starting calibration automatically.");
-    Serial.println("Sit in natural upright driving posture and hold still for 5 seconds.");
-    // single beep: warmup done, calibration starting
-    beep(100);
-    delay(110); // let beep finish before calibration sampling begins
-    startCalibration();
+    Serial.println("Warmup complete — press button to calibrate");
 }
 
-// ── LOOP ──────────────────────────────────────────────────────────
-void loop() {
-    unsigned long now = millis();
-
-    // ── non-blocking buzzer off ───────────────────────────────────
-    // Turns off any scheduled beep burst once its duration expires.
-    // Alarm tone is held by alarmFired flag and overrides this.
-    if (!alarmFired && now >= buzzerOnUntil) {
-        noTone(BUZZER_PIN);
+void startCalibration() {
+    if (calibrationInProgress) {
+        Serial.println("Calibration already in progress");
+        return;
     }
 
+    Serial.println("=== CALIBRATION STARTED ===");
+    Serial.println("Keep head perfectly still for 5 seconds!");
+
+    // Reset calibration variables
+    calibrationInProgress = true;
+    pitchSum = 0;
+    sampleCount = 0;
+    calibsampleCount = 0;
+    baselinePitch        = 0;
+    calibrationStartTime = millis();
+    alarmCount = 0;
+}
+
+void performCalibration(float pitch, float totalRate) {
+    if (!calibrationInProgress) return;
+
+    // Collect samples for the calibration window
+    if (millis() - calibrationStartTime < CALIBRATION_DURATION_MS) {
+        if (totalRate < 5.0f) {
+            pitchSum += pitch;
+            calibsampleCount++;
+        }
+    }
+    else {
+        // Calibration complete
+        if (calibsampleCount >= CALIBRATION_SAMPLES_REQUIRED) {
+            baselinePitch = pitchSum / calibsampleCount;
+            isCalibrated = true;
+
+            Serial.println("=== CALIBRATION COMPLETE ===");
+            Serial.print("Samples: ");
+            Serial.println(calibsampleCount);
+            Serial.print("Baseline Pitch: ");
+            Serial.println(baselinePitch);
+            alarmActive = true; 
+            delay(200);
+            alarmActive = false; 
+            delay(150);
+            alarmActive = true;  
+            delay(200);
+            alarmActive = false;
+        } else {
+            Serial.println("Calibration failed - insufficient samples!");
+        }
+
+        calibrationInProgress = false;
+    }
+}
+
+// MAIN PROGRAM LOOP
+
+void loop() {
     if (!dmpReady) return;
+
     if (!mpu.dmpGetCurrentFIFOPacket(fifoBuffer)) return;
 
-#ifdef OUTPUT_READABLE_YAWPITCHROLL
+    #ifdef OUTPUT_READABLE_YAWPITCHROLL
 
-    mpu.dmpGetQuaternion(&q, fifoBuffer);
-    mpu.dmpGetGravity(&gravity, &q);
-    mpu.dmpGetYawPitchRoll(ypr, &q, &gravity);
+        mpu.dmpGetQuaternion(&q, fifoBuffer);
+        mpu.dmpGetGravity(&gravity, &q);
+        mpu.dmpGetYawPitchRoll(ypr, &q, &gravity);
 
-    float pitch = -(ypr[2] * 180.0f / M_PI);
-    float roll = ypr[1] * 180.0f / M_PI;
+        // depends on the sensor position
+        float pitch = -(ypr[2] * 180/M_PI);
 
-    // ── rate of change ────────────────────────────────────────────
-    static float lastPitch = 0.0f;
-    static float lastRoll = 0.0f;
-    static unsigned long lastSampleTime = 0;
+        
+        unsigned long now = millis();
 
-    float dt = (now - lastSampleTime) / 1000.0f;
-    if (dt > 1.0f) dt = 1.0f / 20.0f; // clamp first sample to 20 Hz assumption
+        // rate of change 
+        static float         lastPitch      = 0;
+        static unsigned long lastSampleTime = 0;
+        static bool          alarmFired     = false;
 
-    float pitchRate = (dt > 0) ? fabsf(pitch - lastPitch) / dt : 0.0f;
-    float totalRate = pitchRate;
+        float dt = (now - lastSampleTime) / 1000.0f;
+        if (dt > 1.0f) dt = 0.05f;   // clamp first sample
 
-    lastPitch = pitch;
-    lastRoll = roll;
-    lastSampleTime = now;
+        float totalRate = (dt > 0) ? abs(pitch - lastPitch) / dt : 0;
 
-    // ── calibration in progress ───────────────────────────────────
+        lastPitch      = pitch;
+        lastSampleTime = now;
+
+        // handle shoulder button press
+        // read and immediately clear the flag
+        // avoids acting on it twice
+        bool doCalibrate = false;
+        if (newCalibRequest) {
+            newCalibRequest = false;
+            doCalibrate     = true;
+        }
+
+        // calibration state machine 
+        if (doCalibrate && !calibrationInProgress) {
+            startCalibration();
+        }
+
     if (calibrationInProgress) {
         performCalibration(pitch, totalRate);
-
-        // rapid double-beep every 500 ms during calibration
-        static unsigned long lastCalibBeep = 0;
-        static int calibBeepPhase = 0;
-        if (now - lastCalibBeep > 500) {
-            lastCalibBeep = now;
-            calibBeepPhase = 0;
+        // only blink during sampling 
+        if (calibrationInProgress) {
+            unsigned long elapsed = millis() - calibrationStartTime;
+            unsigned long phase   = elapsed % 500;
+            alarmActive = (phase < 60) || (phase >= 150 && phase < 210);
         }
-        // two short pulses within the 500 ms window
-        if (calibBeepPhase == 0 && now - lastCalibBeep > 0) {
-            beep(60);
-            calibBeepPhase = 1;
-        }
-        if (calibBeepPhase == 1 && now - lastCalibBeep > 150) {
-            beep(60);
-            calibBeepPhase = 2;
-        }
-
-        return; // skip detection while calibrating
+    return;
     }
 
-    // standalone mode: no bump suppression, no hill compensation
-    const bool isBump = false;
-    const float activePitchThresh = PITCH_THRESHOLD;
+        if (!isCalibrated) {
+            alarmActive = false; // stay silent while waiting for button
+            return;  
+        }
+        unsigned long effectiveAlarmMs;// alarmed state after first detection
+        if      (alarmCount == 0) effectiveAlarmMs = 800;
+        else if (alarmCount == 1) effectiveAlarmMs = 500;
+        else                      effectiveAlarmMs = 200;
 
-    // ── slow baseline drift correction ───────────────────────────
-    // Only when driver is still and no alarm is active.
-    // Time constant ~50 s — longer than max microsleep (~30 s,
-    // Harrison & Horne 1996) so a real drowsy slump cannot erase itself.
-    if (!tiltActive && totalRate < 2.0f) {
-        baselinePitch += (pitch - baselinePitch) * BASELINE_CORRECTION_RATE;
-    }
+        // ── shoulder data processing 
 
-    float relativePitch = pitch - baselinePitch;
+        // bump — true if shoulder reported a jolt within last 200ms
+        bool isBump = (now - bumpTimestamp) < 200;
 
-    // ── drowsiness detection ──────────────────────────────────────
-    // isTriggered: head past threshold AND slow movement AND no bump
-    bool isTriggered = (relativePitch > activePitchThresh)
-                       && (totalRate < 20.0f)
-                       && !isBump;
+        // road tilt — adjust pitch threshold based on hill angle
+        // on a hill drivers body tilts with the car
+        // so we loosen threshold proportionally
+        float hillOffset = roadAngle;
 
-    // isRecovered: head back within recovery zone (hysteresis)
-    bool isRecovered = (fabsf(relativePitch) < PITCH_RECOVERY);
+        if (roadAngle < 0) {
+            // uphill easier to false trigger
+            hillOffset = max(roadAngle * 0.7f, -15.0f);
+        } else {
+            // downhill — body leans backward, harder to genuinely drop forward
+            // slight tightening, capped so it doesn't become too aggressive
+            hillOffset = min(roadAngle *0.7f, 15.0f);
+        }
+        float activePitchThresh = PITCH_THRESHOLD + hillOffset;
 
-    // ── state machine ─────────────────────────────────────────────
-    if (isTriggered) {
-        recoveryCount = 0;
-
-        if (!tiltActive) {
-            tiltStartTime = now;
-            tiltActive = true;
-            alarmFired = false;
+        // relative angles from calibrated baseline 
+        // slowly correct baseline to follow DMP drift
+        // only when driver is still and not in alarm
+        if (!tiltActive && totalRate < 2.0f) {
+            baselinePitch += (pitch - baselinePitch) * BASELINE_CORRECTION_RATE;
         }
 
-        if (now - tiltStartTime >= effectiveAlarmMs()) {
-            // alarm: continuous tone
-            tone(BUZZER_PIN, BUZZER_FREQ);
-            if (!alarmFired) {
-                alarmCount++;
-                alarmFired = true;
-                Serial.print("ALARM #");
-                Serial.println(alarmCount);
+        float relativePitch = pitch - baselinePitch;
+
+        // drowsiness detection 
+
+        // isTriggered conditions:
+        // 1. head is past threshold
+        // 2. movement is slow (not a shake or bump recovery)
+        // 3. no bump reported from shoulder in last 200ms
+        bool isTriggered = (relativePitch > activePitchThresh)
+                           && (totalRate < 20.0f)
+                           && !isBump;
+
+        // isRecovered — looser threshold to avoid LED flickering
+        // on the boundary (hysteresis)
+        bool isRecovered = (abs(relativePitch) < PITCH_RECOVERY);
+
+        if (isTriggered) {
+            recoveryCount = 0;
+
+            if (!tiltActive) {
+                tiltStartTime = now;
+                tiltActive    = true;
+                alarmFired    = false;
+                Serial.println("Threshold crossed");
+            }
+
+            // alarm only after sustained tilt
+            if (now - tiltStartTime >= effectiveAlarmMs) {
+                alarmActive = true;
+                if (!alarmFired) {
+                    alarmCount++;        // count this alarm event
+                    alarmFired = true;
+                    Serial.print("ALARM #");
+                    Serial.println(alarmCount);
+                    Serial.print("Time from threshold to alarm: ");
+                    Serial.print(now - tiltStartTime);
+                    Serial.println(" ms");
+                }
+            }
+
+        } else if (isBump && tiltActive) {
+            // bump arrived while head was tilting
+            // pause the timer — don't reset it fully
+            // because driver might still be drowsy after bump
+            // just give them benefit of the doubt for 200ms
+            // timer resumes when isBump expires naturally
+            recoveryCount = 0;
+
+        } else if (isRecovered) {
+            recoveryCount++;
+
+            if (recoveryCount >= RECOVERY_LIMIT) {
+                // genuine recovery — head is up
+                tiltActive    = false;
+                tiltStartTime = 0;
+                recoveryCount = 0;
+                alarmFired    = false;
+                alarmActive   = false;
             }
         }
-    } else if (isBump && tiltActive) {
-        // bump while head was tilting — pause timer, don't reset.
-        // isBump expires naturally in 200 ms; timer resumes from tiltStartTime.
-        recoveryCount = 0;
-    } else if (isRecovered) {
-        recoveryCount++;
+        // between recovery and trigger threshold it holds state
+        // this prevents flickering on the boundary
 
-        if (recoveryCount >= RECOVERY_LIMIT) {
-            tiltActive = false;
-            tiltStartTime = 0;
-            recoveryCount = 0;
-            alarmFired = false;
-            noTone(BUZZER_PIN);
-            Serial.println("Recovery detected — alarm cleared");
+        //  debug print every 10 samples
+        sampleCount++;
+        if (sampleCount >= 10) {
+            sampleCount = 0;
+
+            Serial.print("RAW p:"); Serial.print(pitch);
+            Serial.print("  p:");   Serial.print(relativePitch);
+            Serial.print(" rate:");    Serial.print(totalRate);
+            Serial.print(" bump:");    Serial.print(isBump);
+            Serial.print(" hill:");    Serial.print(roadAngle);
+            Serial.print(" thresh:");  Serial.print(activePitchThresh);
+            Serial.print(" triggered:"); Serial.print(isTriggered);
+            Serial.print(" recovered:"); Serial.print(isRecovered);
+            Serial.print(" active:");  Serial.print(tiltActive);
+            Serial.print(" elapsed:");
+            Serial.println(tiltActive ? now - tiltStartTime : 0);
         }
-    }
 
-    // ── debug print every 10 samples ─────────────────────────────
-    sampleCount++;
-    if (sampleCount >= 10) {
-        sampleCount = 0;
-        Serial.print("p:");
-        Serial.print(pitch, 2);
-        Serial.print("  rel:");
-        Serial.print(relativePitch, 2);
-        Serial.print(" rate:");
-        Serial.print(totalRate, 2);
-        Serial.print(" thresh:");
-        Serial.print(activePitchThresh, 2);
-        Serial.print(" triggered:");
-        Serial.print(isTriggered);
-        Serial.print(" recovered:");
-        Serial.print(isRecovered);
-        Serial.print(" active:");
-        Serial.print(tiltActive);
-        Serial.print(" elapsed:");
-        Serial.println(tiltActive ? now - tiltStartTime : 0);
-    }
-
-#endif
+    #endif
 }
