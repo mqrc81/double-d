@@ -45,7 +45,7 @@ volatile bool mpuInterrupt = false;
 void dmpDataReady() { mpuInterrupt = true; }
 
 // BUMP DETECTION 
-const float BUMP_RATE_THRESH  = 80.0f;   // °/s — sudden jolt
+const float BUMP_RATE_THRESH  = 55.0f;   // °/s — sudden jolt
 const float ROAD_TILT_THRESH  = 4.0f;   // degrees — uphill/downhill
 #define ROAD_STABLE_MS  500 // tilt must persist 1s
 
